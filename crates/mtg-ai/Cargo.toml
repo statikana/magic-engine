@@ -1,0 +1,13 @@
+[package]
+name = "mtg-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Heuristic evaluation and parallel ISMCTS search for mtg-engine"
+
+[dependencies]
+mtg-engine.workspace = true
+mtg-ir = { workspace = true, default-features = false }
+serde.workspace = true
+smallvec.workspace = true

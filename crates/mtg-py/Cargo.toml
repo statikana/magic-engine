@@ -1,0 +1,19 @@
+[package]
+name = "mtg-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 Python bindings and batched VecEnv stepping for mtg-engine"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+extension-module = ["dep:pyo3", "pyo3/extension-module"]
+
+[dependencies]
+mtg-engine.workspace = true
+mtg-ir = { workspace = true, default-features = false }
+pyo3 = { version = "0.24", optional = true }

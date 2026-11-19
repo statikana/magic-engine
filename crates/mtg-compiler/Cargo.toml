@@ -1,0 +1,12 @@
+[package]
+name = "mtg-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Oracle text tokenizer and recursive-descent compiler targeting mtg-ir v2"
+
+[dependencies]
+mtg-ir.workspace = true
+serde.workspace = true
+thiserror.workspace = true

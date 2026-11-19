@@ -1,0 +1,22 @@
+[package]
+name = "mtg-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned Card IR v2, bitmasks, ManaCost, and CardDatabase codec for mtg-engine"
+
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd"]
+
+[dependencies]
+bitflags.workspace = true
+postcard.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+zstd = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

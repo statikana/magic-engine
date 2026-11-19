@@ -1,0 +1,20 @@
+[package]
+name = "mtg-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stateful WebAssembly wrapper around mtg-engine for browser and JS/TS consumers"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+mtg-engine.workspace = true
+mtg-ir = { workspace = true, default-features = false }
+serde_json.workspace = true
+wasm-bindgen = { version = "0.2", optional = true }

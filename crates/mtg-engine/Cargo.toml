@@ -1,0 +1,18 @@
+[package]
+name = "mtg-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic, format-agnostic, AI-ready Magic: The Gathering rules engine"
+
+[dependencies]
+bitflags.workspace = true
+mtg-ir = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
