@@ -8,7 +8,7 @@ use crate::types::{
 
 /// Object reference resolved at runtime (CR 608.2h LKI-aware).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum Ref {
     SelfObj,
     Target { index: u16 },
@@ -21,7 +21,7 @@ pub enum Ref {
 
 /// Player reference resolved at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum PlayerRef {
     You,
     ControllerOf { of: Box<Ref> },
@@ -130,7 +130,7 @@ pub enum CostPaidCountKind {
 /// All TS Wave wrappers (`p17bMetric`, `p20bCostPaidCount`, etc.) are flattened into first-class
 /// domain variants.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum Amount {
     Const {
         n: i32,
@@ -152,7 +152,8 @@ pub enum Amount {
         player: Option<PlayerRef>,
     },
     ResultCount {
-        of: String,
+        #[serde(default)]
+        of: Option<String>,
     },
     EventAmount,
     CardsIn {
@@ -312,10 +313,16 @@ pub enum Amount {
     },
 
     // Flattened metrics (replacing TS `p17bMetric` / `p20bCostPaidCount`)
-    DistinctManaValuesInGraveyard,
+    DistinctManaValuesInGraveyard {
+        #[serde(default)]
+        filter: Option<Box<ObjectFilter>>,
+    },
     DistinctCreatureTypesControlled,
     DistinctLandNamesControlled,
-    DistinctNamesControlled,
+    DistinctNamesControlled {
+        #[serde(default)]
+        filter: Option<Box<ObjectFilter>>,
+    },
     DistinctNamesCount {
         of: Box<ObjectFilter>,
     },
@@ -482,11 +489,15 @@ pub enum ManaSourceKind {
     Treasure,
 }
 
+fn default_one_u16() -> u16 {
+    1
+}
+
 /// Boolean condition evaluated for intervening-if triggers, static conditions, and step gates.
 ///
 /// All TS Wave wrappers (`p17bCondition`, `p20bCondition`) are flattened into first-class variants.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum Condition {
     Compare {
         left: Box<Amount>,
@@ -750,6 +761,8 @@ pub enum Condition {
     AttackingCount {
         op: CompareOp,
         n: u16,
+        #[serde(default)]
+        filter: Option<Box<ObjectFilter>>,
     },
     AttackingYouCount {
         op: CompareOp,
@@ -853,6 +866,8 @@ pub enum Condition {
     OpponentHadPermEnteredThisTurn {
         #[serde(default)]
         filter: Option<Box<ObjectFilter>>,
+        #[serde(default = "default_one_u16")]
+        min: u16,
     },
     OpponentDrewCardsAtLeastThisTurn {
         min: u16,

@@ -49,8 +49,7 @@ pub enum ManaColor {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-    #[serde(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct ColorMask: u8 {
         const W = 1 << 0;
         const U = 1 << 1;
@@ -83,8 +82,7 @@ impl ColorMask {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-    #[serde(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct CardTypeMask: u16 {
         const LAND         = 1 << 0;
         const CREATURE     = 1 << 1;
@@ -97,6 +95,7 @@ bitflags! {
         const KINDRED      = 1 << 8;
         const DUNGEON      = 1 << 9;
         const EMBLEM       = 1 << 10;
+        const CONSPIRACY   = 1 << 11;
         const PERMANENT    = Self::LAND.bits() | Self::CREATURE.bits() | Self::ARTIFACT.bits()
                            | Self::ENCHANTMENT.bits() | Self::PLANESWALKER.bits() | Self::BATTLE.bits();
     }
@@ -116,6 +115,7 @@ impl CardTypeMask {
             "kindred" | "tribal" => Self::KINDRED,
             "dungeon" => Self::DUNGEON,
             "emblem" => Self::EMBLEM,
+            "conspiracy" => Self::CONSPIRACY,
             "permanent" => Self::PERMANENT,
             _ => Self::empty(),
         }
@@ -123,8 +123,7 @@ impl CardTypeMask {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-    #[serde(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct SupertypeMask: u8 {
         const BASIC     = 1 << 0;
         const LEGENDARY = 1 << 1;
@@ -160,8 +159,7 @@ pub enum Zone {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-    #[serde(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct ZoneMask: u8 {
         const LIBRARY     = 1 << 0;
         const HAND        = 1 << 1;
@@ -188,6 +186,32 @@ impl ZoneMask {
         }
     }
 }
+
+macro_rules! impl_bitmask_int_serde {
+    ($ty:ty, $raw:ty) => {
+        impl Serialize for $ty {
+            #[inline]
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.bits().serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            #[inline]
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let bits = <$raw>::deserialize(deserializer)?;
+                Self::from_bits(bits).ok_or_else(|| {
+                    serde::de::Error::custom(format!("invalid {} bits: {bits:#x}", stringify!($ty)))
+                })
+            }
+        }
+    };
+}
+
+impl_bitmask_int_serde!(ColorMask, u8);
+impl_bitmask_int_serde!(CardTypeMask, u16);
+impl_bitmask_int_serde!(SupertypeMask, u8);
+impl_bitmask_int_serde!(ZoneMask, u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -305,12 +329,13 @@ pub enum PlayerCounterKind {
 #[serde(rename_all = "camelCase")]
 pub enum CounterTarget {
     Any,
+    Each,
     Specific(CounterId),
 }
 
 /// Printed power/toughness on a card face (`None` for non-creatures without printed P/T).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum PrintedPt {
     Fixed {
         power: i32,
@@ -325,7 +350,7 @@ pub enum PrintedPt {
 
 /// A single non-generic mana symbol in a parsed [`ManaCost`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum ManaPip {
     Colored { color: ManaColor },
     Snow,
@@ -341,7 +366,7 @@ pub enum ManaPip {
 #[serde(deny_unknown_fields)]
 pub struct ManaCost {
     #[serde(default)]
-    pub generic: u16,
+    pub generic: u32,
     #[serde(default)]
     pub x_count: u8,
     #[serde(default)]
@@ -378,7 +403,7 @@ impl ManaCost {
 
     fn push_symbol(&mut self, sym: &str) {
         let up = sym.to_ascii_uppercase();
-        if let Ok(n) = up.parse::<u16>() {
+        if let Ok(n) = up.parse::<u32>() {
             self.generic = self.generic.saturating_add(n);
             return;
         }
@@ -412,14 +437,14 @@ impl ManaCost {
                                 self.pips.push(ManaPip::TwoBrid { color: mc });
                             }
                         }
-                        ("C", c) => {
-                            if let Some(mc) = parse_color(c) {
-                                self.pips.push(ManaPip::ColorlessHybrid { color: mc });
-                            }
-                        }
                         (c, "P") => {
                             if let Some(mc) = parse_color(c) {
                                 self.pips.push(ManaPip::Phyrexian { color: mc });
+                            }
+                        }
+                        ("C", c) => {
+                            if let Some(mc) = parse_color(c) {
+                                self.pips.push(ManaPip::ColorlessHybrid { color: mc });
                             }
                         }
                         (a, b) => {
@@ -440,12 +465,12 @@ impl ManaCost {
 
     /// Mana value per CR 202.3 (X = 0 outside the stack; two-brid counts as 2).
     pub fn mana_value(&self) -> u32 {
-        let mut mv = u32::from(self.generic);
+        let mut mv = self.generic;
         for pip in &self.pips {
-            mv += match pip {
+            mv = mv.saturating_add(match pip {
                 ManaPip::TwoBrid { .. } => 2,
                 _ => 1,
-            };
+            });
         }
         mv
     }

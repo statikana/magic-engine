@@ -12,7 +12,7 @@ use crate::types::{
 use crate::value::{Amount, Condition, PlayerRef, Ref};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum Selector {
     SelfObj,
     Binding {
@@ -61,7 +61,7 @@ fn default_optional_mode() -> OptionalMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StepGate {
     IfPrecedingAccepted {
         step_index: u16,
@@ -383,7 +383,7 @@ pub enum ManaChoiceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum ManaProduction {
     Fixed {
         symbols: SmallVec<[ManaColor; 4]>,
@@ -510,6 +510,13 @@ pub struct DigDestinationBucket {
     pub tapped: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DigRestOrder {
+    Any,
+    Random,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DigSpec {
@@ -536,6 +543,8 @@ pub struct DigSpec {
     pub rest: DigRestTo,
     #[serde(default)]
     pub rest_random: bool,
+    #[serde(default)]
+    pub rest_order: Option<DigRestOrder>,
     #[serde(default)]
     pub until_filter: Option<Box<ObjectFilter>>,
     #[serde(default)]
@@ -677,7 +686,7 @@ pub struct PileSplitSpec {
     pub pile_maker: PileSide,
     pub pile_chooser: PileSide,
     pub chosen_to: Zone,
-    pub other_to: Zone,
+    pub other_to: DigRestTo,
     #[serde(default)]
     pub other_random_order: bool,
 }
@@ -835,7 +844,7 @@ pub struct CoerciveDiscardSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum PartialRevealSpec {
     RandomOne,
     Count { amount: Box<Amount> },
@@ -1016,7 +1025,7 @@ pub struct DelayedInlineTriggerSpec {
 
 /// Strongly-typed effect operation enum replacing TS's `Verb` + 150-field `EffectParams` bag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum EffectOp {
     Destroy {
         #[serde(default)]
@@ -1348,6 +1357,8 @@ pub enum EffectOp {
         restriction_spec: Option<Box<ManaSpendingRestriction>>,
         #[serde(default)]
         retain_until_eot: bool,
+        #[serde(default)]
+        delayed_rider: Option<Box<DelayedTriggerPayload>>,
     },
     RetainMana {
         /// `ColorMask::ALL_COLORS | ColorMask::C` for all.

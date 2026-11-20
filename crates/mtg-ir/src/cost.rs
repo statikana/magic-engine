@@ -6,7 +6,7 @@ use crate::types::{ColorMask, CounterId, CounterTarget, KeywordId, ManaColor, Ma
 use crate::value::Amount;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CostObjectTarget {
     SelfObj,
     Filter { filter: Box<ObjectFilter> },
@@ -28,7 +28,7 @@ pub struct MinColoredManaSymbols {
 
 /// Cost paid to cast a spell, activate an ability, or satisfy an optional/punisher step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CostDef {
     Mana {
         cost: ManaCost,

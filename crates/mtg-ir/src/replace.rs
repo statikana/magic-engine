@@ -24,9 +24,10 @@ pub enum DamageModMode {
     Add,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DamageModTarget {
+    #[default]
     Any,
     Opponent,
     OpponentOrOpponentPerm,
@@ -45,6 +46,7 @@ pub struct DamageScaleSpec {
     pub combat_only: bool,
     #[serde(default)]
     pub source_filter: Option<Affected>,
+    #[serde(default)]
     pub target_filter: DamageModTarget,
 }
 
@@ -89,7 +91,7 @@ pub struct EtbCopySpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum EtbChoiceSpec {
     SubType {
         scope: SubTypeChoiceScope,
@@ -140,6 +142,13 @@ pub enum EtbChoiceSpec {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum OpponentDiscardToBattlefield {
+    Plain,
+    WithCounters { counter: CounterId, count: u16 },
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneChangeMod {
@@ -180,7 +189,7 @@ pub struct ZoneChangeMod {
     #[serde(default)]
     pub exile_with_counter: Option<CounterId>,
     #[serde(default)]
-    pub opponent_discard_to_battlefield: Option<Option<(CounterId, u16)>>,
+    pub opponent_discard_to_battlefield: Option<OpponentDiscardToBattlefield>,
     #[serde(default)]
     pub dealt_damage_exile_on_die: Option<DealtDamageExileScope>,
     #[serde(default)]
@@ -195,7 +204,7 @@ pub struct ZoneChangeMod {
 
 /// Strongly-typed replacement outcome (CR 614–616), eliminating TS's 55-field `modify` bag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum ReplacementWith {
     Skip,
     Execute {

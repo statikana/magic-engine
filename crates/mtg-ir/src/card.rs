@@ -255,6 +255,8 @@ pub struct KeywordAbility {
 #[serde(deny_unknown_fields)]
 pub struct SpellAbility {
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
     pub additional_costs: Vec<CostDef>,
     #[serde(default)]
     pub targets: Vec<TargetSpec>,
@@ -379,6 +381,8 @@ pub struct UnsupportedAbility {
     pub cost: Vec<CostDef>,
     #[serde(default)]
     pub cost_complete: Option<bool>,
+    #[serde(default)]
+    pub cost_keyword: Option<KeywordId>,
     #[serde(default)]
     pub timing: Option<Timing>,
     #[serde(default)]

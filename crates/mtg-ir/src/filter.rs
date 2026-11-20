@@ -37,6 +37,8 @@ pub struct PlayerFilter {
 pub enum RelativeControl {
     You,
     Opponent,
+    Opponents,
+    All,
     Any,
 }
 
@@ -63,9 +65,8 @@ bitflags! {
     /// Fast-path boolean flags on [`ObjectFilter`].
     ///
     /// Positive/negative tri-state properties (e.g. tapped vs untapped) use separate bits so
-    /// an unspecified property leaves both bits clear.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-    #[serde(transparent)]
+    /// an unspecified property leaves both bits clear. Frozen at bits `0..=52` for JS `Number` safety.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct FilterFlags: u64 {
         const OTHER                        = 1 << 0;
         const TAPPED                       = 1 << 1;
@@ -123,10 +124,28 @@ bitflags! {
     }
 }
 
+impl Serialize for FilterFlags {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.bits().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterFlags {
+    #[inline]
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bits = u64::deserialize(deserializer)?;
+        Self::from_bits(bits)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid FilterFlags bits: {bits:#x}")))
+    }
+}
+
 /// Rarer relational/dynamic predicates on [`ObjectFilter`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum ObjectPredicate {
+    NotSelf,
+    PlayerOnly,
     Named {
         name: String,
     },

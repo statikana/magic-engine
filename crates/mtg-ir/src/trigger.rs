@@ -8,7 +8,7 @@ use crate::types::{
 use crate::value::Condition;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum TriggerSubject {
     SelfObj,
     AttachedTo,
@@ -229,7 +229,7 @@ pub struct EventFilter {
 
 /// Event-kind-specific filter qualifiers (only allocated for the event kind in question).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum EventDetail {
     ZoneChange {
         #[serde(default)]
@@ -283,6 +283,8 @@ pub enum EventDetail {
         #[serde(default)]
         blocked_attacker_filter: Option<Box<ObjectFilter>>,
         #[serde(default)]
+        host: Option<Box<ObjectFilter>>,
+        #[serde(default)]
         without_flanking: bool,
         #[serde(default)]
         attacked_target: Option<AttackedTargetFilter>,
@@ -302,6 +304,12 @@ pub enum EventDetail {
         attack_enchanted_or_attacked_by_enchanted: bool,
         #[serde(default)]
         attacking_unblocked: bool,
+    },
+    LandPlayed {
+        #[serde(default)]
+        cast_from_not_hand: bool,
+        #[serde(default)]
+        cast_from_zone: Option<Zone>,
     },
     Damage {
         #[serde(default)]

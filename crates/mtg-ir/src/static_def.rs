@@ -37,7 +37,7 @@ pub enum Layer {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum Affected {
     SelfObj,
     AttachedTo,
@@ -54,7 +54,7 @@ pub enum ProtectionAttachmentExemption {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum AbilityGrantSource {
     ExiledWithSelf {
         filter: Box<ObjectFilter>,
@@ -72,7 +72,7 @@ pub enum AbilityGrantSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum LayerMod {
     SetController {
         controller: PlayerRef,
@@ -168,7 +168,7 @@ pub enum LayerMod {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum SpellOrAbilityFilter {
     Spell {
         filter: Box<ObjectFilter>,
@@ -204,7 +204,7 @@ pub enum SpellOrAbilityFilter {
 
 /// Strongly-typed game-rule modifier replacing TS's `RuleModKind` + `Record<string, unknown>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum RuleMod {
     NoMaxHandSize,
     MaxHandSizeDelta {
@@ -364,7 +364,7 @@ pub enum CrewSaddleScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum CombatRuleSpec {
     CantBlockExcept {
         filter: Box<ObjectFilter>,
@@ -477,7 +477,7 @@ pub enum SlotMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StaticDamageAmount {
     Fixed { n: u16 },
     All,
@@ -485,7 +485,7 @@ pub enum StaticDamageAmount {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StaticDamageTarget {
     SelfObj,
     AttachedTo,
@@ -496,7 +496,7 @@ pub enum StaticDamageTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StaticDamageSourceFilter {
     Filter { filter: Box<ObjectFilter> },
     BlockingOrBlockedBySelf,
@@ -513,12 +513,22 @@ pub struct PhantomCounterRemoval {
     pub require_counter_present: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum PreventedToAmount {
+    Prevented,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StaticOnPrevented {
     PutPlusCountersPerDamage,
     ShuffleTargetIntoLibrary,
-    ReflexiveDamageTrigger { target: Box<TargetSpec> },
+    ReflexiveDamageTrigger {
+        target: Box<TargetSpec>,
+        #[serde(default)]
+        to_amount: Option<PreventedToAmount>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -573,7 +583,7 @@ pub struct StaticDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum StaticBody {
     Continuous {
         layer: Layer,
@@ -601,7 +611,7 @@ pub enum StaticBody {
     },
     Multiplier {
         what: MultiplierTarget,
-        factor: u16,
+        factor: f32,
         #[serde(default)]
         delta: i16,
         #[serde(default)]
@@ -681,6 +691,8 @@ pub enum StaticBody {
     },
     AltCastPermission {
         mana_cost: ManaCost,
+        #[serde(default)]
+        use_printed_mana_cost: bool,
         #[serde(default)]
         cost_defs: Vec<CostDef>,
         affected: Affected,
