@@ -4,22 +4,70 @@
 //! (`mtg-wasm`, `mtg-py`, `mtg-cli`, `magic-web`) interact through [`MatchSession`].
 
 pub mod action;
+pub mod auto_tap;
+pub mod casting;
+pub mod choices;
+pub mod combat;
+pub mod commander;
 pub mod config;
+pub mod costs;
+pub mod determinize;
+pub mod effects;
+pub mod eval;
+pub mod events;
+pub mod faces;
+pub mod filter;
 pub mod id;
+pub mod keywords;
+pub mod layers;
+pub mod legality;
+pub mod mana;
+pub mod observe;
+pub mod replace;
 pub mod replay;
 pub mod rng;
+pub mod sba;
 pub mod session;
+pub mod stack;
 pub mod state;
+pub mod targets;
+pub mod triggers;
+pub mod turn;
 pub mod view;
+pub mod zones;
 
 pub use action::*;
+pub use auto_tap::*;
+pub use casting::*;
+pub use choices::*;
+pub use combat::*;
+pub use commander::*;
 pub use config::*;
+pub use costs::*;
+pub use determinize::*;
+pub use effects::*;
+pub use eval::*;
+pub use events::*;
+pub use faces::*;
+pub use filter::*;
 pub use id::*;
+pub use keywords::*;
+pub use layers::*;
+pub use legality::*;
+pub use mana::*;
+pub use observe::*;
+pub use replace::*;
 pub use replay::*;
 pub use rng::*;
+pub use sba::*;
 pub use session::*;
+pub use stack::*;
 pub use state::*;
+pub use targets::*;
+pub use triggers::*;
+pub use turn::*;
 pub use view::*;
+pub use zones::*;
 
 #[cfg(test)]
 mod tests {
@@ -65,13 +113,13 @@ mod tests {
             source_compiler_version: 46,
             tables: InternTables::default(),
             cards: vec![CardDef {
-                oracle_id: "card_wastes".into(),
+                oracle_id: "synth_wastes".into(),
                 compiler_version: 46,
                 text_hash: "00000000".into(),
-                name: "Wastes".into(),
+                name: "Synth Wastes".into(),
                 layout: CardLayout::Normal,
                 faces: vec![FaceDef {
-                    name: "Wastes".into(),
+                    name: "Synth Wastes".into(),
                     characteristics: Characteristics {
                         mana_cost: ManaCost::default(),
                         types: CardTypeMask::LAND,

@@ -102,12 +102,24 @@ pub enum DecisionState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum CostAidKind {
+    Convoke,
+    Improvise,
+    Delve,
+    Emerge,
+    Waterbend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SpecialActionKind {
     Suspend { object: ObjectId, x_value: u16 },
     TurnFaceUp { object: ObjectId },
     UnlockRoomDoor { object: ObjectId, face_index: u8 },
     CompanionToHand,
     HandSpecialAction { object: ObjectId, action_index: u16 },
+    Foretell { object: ObjectId },
+    Plot { object: ObjectId },
 }
 
 /// Low-branching canonical sequential action (consumed by both `GameState` and `mtg-ai`).
@@ -160,6 +172,25 @@ pub enum Action {
         answer: ChoiceAnswer,
     },
     Concede,
+    SelectTarget {
+        target: TargetRef,
+    },
+    DoneTargets,
+    AssignDivision {
+        target: TargetRef,
+        amount: u32,
+    },
+    ToggleOptionalCost {
+        index: u16,
+    },
+    DoneOptionalCosts,
+    PayFromPool,
+    AutoPayMana,
+    SelectCostAid {
+        aid_kind: CostAidKind,
+        object: ObjectId,
+    },
+    CancelCast,
 }
 
 /// Convenience batch actions submitted by human UIs and lowered atomically into `Vec<Action>`.

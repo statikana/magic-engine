@@ -6,9 +6,14 @@ license.workspace = true
 repository.workspace = true
 description = "Deterministic, format-agnostic, AI-ready Magic: The Gathering rules engine"
 
+[features]
+default = []
+verify-layer-cache = []
+
 [dependencies]
 bitflags.workspace = true
 mtg-ir = { workspace = true, default-features = false }
+postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
