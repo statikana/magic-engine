@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use mtg_ir::{AbilityDef, CardDatabase, CardDefId, CardTypeMask, KeywordDef, Zone};
+use mtg_ir::{
+    AbilityDef, CardDatabase, CardDefId, CardTypeMask, CostDef, KeywordDef, ManaCost, Zone,
+};
 use smallvec::SmallVec;
 
 use crate::action::ChoiceRequest;
@@ -43,6 +45,29 @@ fn find_card_keyword<'a>(
     })
 }
 
+fn keyword_turn_up_costs(
+    db: &CardDatabase,
+    card_def: CardDefId,
+    kw_name: &str,
+) -> (Option<ManaCost>, Vec<CostDef>) {
+    let kw = find_card_keyword(db, card_def, kw_name);
+    let mana_cost = kw.and_then(|k| k.cost.clone());
+    let cost_defs = kw
+        .map(|k| {
+            if mana_cost.is_some() {
+                k.cost_defs
+                    .iter()
+                    .filter(|c| !matches!(c, CostDef::Mana { .. }))
+                    .cloned()
+                    .collect()
+            } else {
+                k.cost_defs.clone()
+            }
+        })
+        .unwrap_or_default();
+    (mana_cost, cost_defs)
+}
+
 fn recompute_face_down_turn_up_costs(
     db: &CardDatabase,
     card_def: CardDefId,
@@ -58,24 +83,24 @@ fn recompute_face_down_turn_up_costs(
                 .map(|f| f.characteristics.mana_cost.clone());
         }
         FaceDownKind::Morph => {
-            let kw = find_card_keyword(db, card_def, "morph");
-            spec.turn_up_mana_cost = kw.and_then(|k| k.cost.clone());
-            spec.turn_up_cost_defs = kw.map(|k| k.cost_defs.clone()).unwrap_or_default();
+            let (mana_cost, cost_defs) = keyword_turn_up_costs(db, card_def, "morph");
+            spec.turn_up_mana_cost = mana_cost;
+            spec.turn_up_cost_defs = cost_defs;
         }
         FaceDownKind::Megamorph => {
-            let kw = find_card_keyword(db, card_def, "megamorph");
-            spec.turn_up_mana_cost = kw.and_then(|k| k.cost.clone());
-            spec.turn_up_cost_defs = kw.map(|k| k.cost_defs.clone()).unwrap_or_default();
+            let (mana_cost, cost_defs) = keyword_turn_up_costs(db, card_def, "megamorph");
+            spec.turn_up_mana_cost = mana_cost;
+            spec.turn_up_cost_defs = cost_defs;
         }
         FaceDownKind::Disguise => {
-            let kw = find_card_keyword(db, card_def, "disguise");
-            spec.turn_up_mana_cost = kw.and_then(|k| k.cost.clone());
-            spec.turn_up_cost_defs = kw.map(|k| k.cost_defs.clone()).unwrap_or_default();
+            let (mana_cost, cost_defs) = keyword_turn_up_costs(db, card_def, "disguise");
+            spec.turn_up_mana_cost = mana_cost;
+            spec.turn_up_cost_defs = cost_defs;
         }
         FaceDownKind::Foretell => {
-            let kw = find_card_keyword(db, card_def, "foretell");
-            spec.turn_up_mana_cost = kw.and_then(|k| k.cost.clone());
-            spec.turn_up_cost_defs = kw.map(|k| k.cost_defs.clone()).unwrap_or_default();
+            let (mana_cost, cost_defs) = keyword_turn_up_costs(db, card_def, "foretell");
+            spec.turn_up_mana_cost = mana_cost;
+            spec.turn_up_cost_defs = cost_defs;
         }
         FaceDownKind::ExiledFaceDown | FaceDownKind::Cyberman | FaceDownKind::Other => {
             spec.turn_up_mana_cost = None;
@@ -646,6 +671,7 @@ pub fn determinize_state(state: &GameState, viewer: PlayerId, rng: &mut RngState
         {
             redact_lki(Arc::make_mut(lki));
         }
+        scrub_bindings(state, &mut trig.bindings, viewer, cache);
     }
     for dt in cloned.delayed_triggers_mut() {
         let hide_src = dt.source_object.is_some_and(|oid| {
@@ -661,6 +687,7 @@ pub fn determinize_state(state: &GameState, viewer: PlayerId, rng: &mut RngState
                 redact_lki(Arc::make_mut(lki));
             }
         }
+        scrub_bindings(state, &mut dt.bindings, viewer, cache);
     }
     for rt in cloned.pending_reflexive_triggers_mut() {
         if should_redact_lki(state, &rt.source_lki, viewer, cache) {

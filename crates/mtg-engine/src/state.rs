@@ -1617,6 +1617,10 @@ pub enum ReplacementResumeHook {
         in_cleanup: bool,
     },
     TurnStep(TurnReplacementContext),
+    MegamorphTurnFaceUp {
+        object: ObjectId,
+        player: PlayerId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4067,6 +4071,7 @@ impl GameState {
             if let Some(ref lki) = trig.event_lki {
                 push_lki(&mut keep, lki);
             }
+            push_bindings(&mut keep, &trig.bindings);
         }
 
         for rtrig in &self.pending_reflexive_triggers {
@@ -4283,12 +4288,17 @@ impl GameState {
             }
         }
 
-        if let Some(ReplacementResumeHook::StackResolutionFinish {
-            attach_target: Some(at),
-            ..
-        }) = self.pending_replacement_resume
-        {
-            push_oid(&mut keep, at);
+        match self.pending_replacement_resume {
+            Some(ReplacementResumeHook::StackResolutionFinish {
+                attach_target: Some(at),
+                ..
+            }) => {
+                push_oid(&mut keep, at);
+            }
+            Some(ReplacementResumeHook::MegamorphTurnFaceUp { object, .. }) => {
+                push_oid(&mut keep, object);
+            }
+            _ => {}
         }
 
         if let Some(ref batch) = self.pending_sba_batch {
@@ -4391,6 +4401,7 @@ impl GameState {
             for &wo in &dt.watched_objects {
                 push_oid(&mut keep, wo);
             }
+            push_bindings(&mut keep, &dt.bindings);
         }
 
         loop {
@@ -5774,6 +5785,7 @@ mod tests {
                 last_tapped_mana_colors: SmallVec::new(),
                 is_look_back: false,
                 x_value: 0,
+                bindings: Vec::new(),
             });
         state.pending_prompt = Some(Box::new(PendingPromptContext {
             prompt_id: 77,
@@ -5807,6 +5819,7 @@ mod tests {
                 expiry: crate::triggers::DelayedExpiry::ThisTurn,
                 watched_objects: SmallVec::new(),
                 x_value: 0,
+                bindings: Vec::new(),
             });
 
         assert!(state.stack().is_empty());

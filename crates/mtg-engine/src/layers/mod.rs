@@ -919,13 +919,14 @@ pub(crate) fn compute_layer_cache_inner(
                 has_copy_pt_power_except,
                 has_copy_pt_toughness_except,
                 active_face_indices,
+                resolved_ward_cost,
             ) = if !is_face_down
                 && copiable.is_none_or(|c| c.card_def == TOKEN_CARD_DEF_ID)
                 && let Some(spec) = rare.and_then(|r| r.token_spec.as_deref())
             {
                 let (nm, mut ev) = evaluate_token_spec_base(spec, copiable);
                 ev.controller = init_controller;
-                (nm, ev, false, false, false, SmallVec::new())
+                (nm, ev, false, false, false, SmallVec::new(), None)
             } else if let Some(resolved) = resolve_object_faces(state.db(), obj.card_def, &opts) {
                 let except_pt = copiable.and_then(|c| c.except.as_ref()).and_then(|e| e.pt);
                 let ev = EvaluatedObject {
@@ -952,6 +953,7 @@ pub(crate) fn compute_layer_cache_inner(
                     except_pt.is_some(),
                     except_pt.is_some(),
                     resolved.active_face_indices,
+                    resolved.ward_cost,
                 )
             } else {
                 let ev = EvaluatedObject {
@@ -971,7 +973,15 @@ pub(crate) fn compute_layer_cache_inner(
                     name_override: None,
                     mana_cost: ManaCost::default(),
                 };
-                (String::new(), ev, false, false, false, SmallVec::new())
+                (
+                    String::new(),
+                    ev,
+                    false,
+                    false,
+                    false,
+                    SmallVec::new(),
+                    None,
+                )
             };
 
             if !is_face_down {
@@ -1017,6 +1027,27 @@ pub(crate) fn compute_layer_cache_inner(
                 next_item_id += 1;
             }
             eval.keywords.clear();
+            if is_face_down && let Some(wc) = resolved_ward_cost {
+                let generic = wc.mana_value();
+                if generic > 0 {
+                    items.push(WorkAbilityItem {
+                        id: next_item_id,
+                        is_innate: true,
+                        is_intrinsic_basic_mana: false,
+                        required_basic_subtype: None,
+                        is_mana_ability: false,
+                        keyword: subtype_table.ward_kw,
+                        keyword_param: None,
+                        granted_ability: Some(predicates::GrantedAbilityEntry::DynamicWard {
+                            generic,
+                            grant_source: None,
+                        }),
+                        timestamp: 0,
+                        removed: false,
+                    });
+                    next_item_id += 1;
+                }
+            }
 
             let perm_idx = board.perms.len();
             if let Some(slot) = board.index_by_obj.get_mut(id.index as usize) {
@@ -1073,6 +1104,7 @@ pub(crate) fn compute_layer_cache_inner(
     let mut ab_buf: Vec<ActiveAbilityWithCardRef<'_>> = Vec::with_capacity(16);
     for (perm_idx, info) in init_infos.iter().enumerate() {
         if info.is_face_down {
+            board.perms[perm_idx].sync_abilities();
             continue;
         }
         ab_buf.clear();

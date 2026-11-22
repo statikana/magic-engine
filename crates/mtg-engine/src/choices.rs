@@ -369,6 +369,20 @@ pub fn apply_choice_answer(
                         )?;
                         Ok(())
                     }
+                    Some(ReplacementResumeHook::MegamorphTurnFaceUp { object, player }) => {
+                        emit_event(
+                            state,
+                            AtomicEventKind::TurnedFaceUp {
+                                object,
+                                player,
+                                x_value: None,
+                            },
+                        );
+                        flush_triggers(state);
+                        let _ = crate::casting::prepare_next_untargeted_stack_trigger(state)?;
+                        let _ = crate::turn::grant_priority_with_sba_and_triggers(state)?;
+                        Ok(())
+                    }
                     None => {
                         flush_triggers(state);
                         let _ = crate::casting::prepare_next_untargeted_stack_trigger(state)?;
@@ -424,6 +438,23 @@ pub fn apply_choice_answer(
                             ctx,
                             ReplacementResumeOutcome::EffectResolved(outcome),
                         )?;
+                        Ok(())
+                    }
+                    Some(ReplacementResumeHook::MegamorphTurnFaceUp { object, player }) => {
+                        crate::effects::counters_mods::apply_resolved_put_counters(
+                            state, &outcome, player,
+                        );
+                        emit_event(
+                            state,
+                            AtomicEventKind::TurnedFaceUp {
+                                object,
+                                player,
+                                x_value: None,
+                            },
+                        );
+                        flush_triggers(state);
+                        let _ = crate::casting::prepare_next_untargeted_stack_trigger(state)?;
+                        let _ = crate::turn::grant_priority_with_sba_and_triggers(state)?;
                         Ok(())
                     }
                     None => {

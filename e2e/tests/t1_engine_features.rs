@@ -1027,7 +1027,8 @@ fn t1_f06_01_split_mdfc_adventure_face_casting() {
     .unwrap();
     drv.keep_all_hands();
 
-    // Turn 1: Play MDFC back face as a land (`face_index: 1`).
+    // Turn 1+: Play MDFC back face as a land (`face_index: 1`).
+    let mut t_mdfc = 1u32;
     for turn in [1u32, 3, 5] {
         drv.advance_to_preserving(
             turn,
@@ -1037,6 +1038,7 @@ fn t1_f06_01_split_mdfc_adventure_face_casting() {
         )
         .unwrap();
         if drv.find_hand_object(PlayerId(0), mdfc).is_some() {
+            t_mdfc = turn;
             break;
         }
     }
@@ -1055,8 +1057,8 @@ fn t1_f06_01_split_mdfc_adventure_face_casting() {
     assert!(drv.find_battlefield_object(PlayerId(0), mdfc).is_some());
 
     // Turn 3+: Play Mountain, cast Adventure half (`option_id: 1`, {R}), verify exile.
-    let mut t_adv = 3u32;
-    for turn in [3u32, 5, 7, 9] {
+    let mut t_adv = t_mdfc + 2;
+    for turn in ((t_mdfc + 2)..=(t_mdfc + 8)).step_by(2) {
         drv.advance_to_preserving(
             turn,
             GamePhase::Main1,
@@ -4195,21 +4197,24 @@ fn t1_f10_03_intervening_if_dual_check_cr603_4() {
         c.mana_cost("{R}")
             .types(CardTypeMask::ENCHANTMENT)
             .triggered_ability_if(
-                simple_trigger(
-                    EventKind::PhaseBegin,
-                    EventFilter {
-                        detail: Some(EventDetail::Phase {
-                            phase: Some(GamePhase::Upkeep),
-                            any_main_phase: false,
-                            enchanted_controller_upkeep: false,
-                            enchanted_player_upkeep: false,
-                            enchanted_opponent_end_step: false,
-                            phase_chosen_player: false,
-                            turn_filter: None,
-                        }),
-                        ..Default::default()
-                    },
-                ),
+                mtg_ir::TriggerDef {
+                    scope: Some(mtg_ir::TriggerScope::ControllerTurn),
+                    ..simple_trigger(
+                        EventKind::PhaseBegin,
+                        EventFilter {
+                            detail: Some(EventDetail::Phase {
+                                phase: Some(GamePhase::Upkeep),
+                                any_main_phase: false,
+                                enchanted_controller_upkeep: false,
+                                enchanted_player_upkeep: false,
+                                enchanted_opponent_end_step: false,
+                                phase_chosen_player: false,
+                                turn_filter: None,
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                },
                 Condition::ControlsFilter {
                     filter: Box::new(ObjectFilter {
                         zones: ZoneMask::BATTLEFIELD,
@@ -6899,6 +6904,14 @@ fn t1_f14_02_turn_based_actions_untap_draw_cleanup() {
                 )
                 .unwrap();
             }
+            DecisionState::DeclareAttackers => {
+                let actor = drv.session.current_actor().unwrap();
+                drv.step(actor, Action::ConfirmAttackers).unwrap();
+            }
+            DecisionState::DeclareBlockers => {
+                let actor = drv.session.current_actor().unwrap();
+                drv.step(actor, Action::ConfirmBlockers).unwrap();
+            }
             other => panic!("unexpected decision while advancing to Turn 3 Main1: {other:?}"),
         }
     }
@@ -7145,6 +7158,14 @@ fn t1_f14_03_iterative_sba_fixpoint_cr704_3() {
                         },
                     )
                     .unwrap();
+                }
+                DecisionState::DeclareAttackers => {
+                    let actor = drv.session.current_actor().unwrap();
+                    drv.step(actor, Action::ConfirmAttackers).unwrap();
+                }
+                DecisionState::DeclareBlockers => {
+                    let actor = drv.session.current_actor().unwrap();
+                    drv.step(actor, Action::ConfirmBlockers).unwrap();
                 }
                 other => panic!("unexpected decision during SBA advance: {other:?}"),
             }
@@ -8072,6 +8093,14 @@ fn t1_f17_01_rename_invariance_across_non_name_cards() {
                                 },
                             )
                             .unwrap();
+                        }
+                        DecisionState::DeclareAttackers => {
+                            let actor = drv.session.current_actor().unwrap();
+                            drv.step(actor, Action::ConfirmAttackers).unwrap();
+                        }
+                        DecisionState::DeclareBlockers => {
+                            let actor = drv.session.current_actor().unwrap();
+                            drv.step(actor, Action::ConfirmBlockers).unwrap();
                         }
                         other => {
                             panic!("unexpected state advancing in rename invariance: {other:?}")

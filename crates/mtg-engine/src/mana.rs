@@ -4345,6 +4345,7 @@ pub fn deduct_mana_for_context(
                 expiry,
                 watched_objects: ctx.source_object.into_iter().collect(),
                 x_value: 0,
+                bindings: Vec::new(),
             },
         );
         state.push_pending_mana_delayed_rider(PendingManaDelayedRider {

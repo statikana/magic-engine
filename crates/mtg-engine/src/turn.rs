@@ -491,7 +491,8 @@ pub fn apply_concede(
                 return run_cleanup_step(state);
             }
             Some(ReplacementResumeHook::TurnStep(TurnReplacementContext::DrawStep { .. }))
-            | Some(ReplacementResumeHook::StackResolutionFinish { .. }) => {
+            | Some(ReplacementResumeHook::StackResolutionFinish { .. })
+            | Some(ReplacementResumeHook::MegamorphTurnFaceUp { .. }) => {
                 flush_triggers(state);
                 let _ = prepare_next_untargeted_stack_trigger(state)?;
                 return grant_priority_with_sba_and_triggers(state);

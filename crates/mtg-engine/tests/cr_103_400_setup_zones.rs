@@ -1048,3 +1048,223 @@ fn synth_cr709_715_split_fuse_and_adventure_zone_characteristics() {
         "QuestKnight must resolve onto battlefield from Exile"
     );
 }
+
+#[test]
+fn synth_cr307_4_mdfc_sorcery_front_land_back_enters_battlefield() {
+    use mtg_engine::EngineError;
+    use mtg_ir::{
+        AbilityDef, ActivatedAbility, CostDef, ManaProduction, Span, TargetKind, TargetSpec, Timing,
+    };
+
+    let mut b = SynthBundleBuilder::new();
+    let plains =
+        b.add_synth_basic_land("synth_plains_3074", "Synth Plains", "Plains", ManaColor::W);
+    let mdfc = b.add_card("synth_mdfc_3074", "Synth Flare // Synth Crag", |c| {
+        c.layout(CardLayout::ModalDfc)
+            .mana_cost("{R}")
+            .types(CardTypeMask::SORCERY)
+            .spell_effect(
+                vec![],
+                vec![effect_step(
+                    EffectOp::GainLife {
+                        set_life_total: false,
+                    },
+                    Selector::PlayerRef {
+                        player: PlayerRef::You,
+                    },
+                    Some(Amount::Const { n: 2 }),
+                )],
+            )
+            .add_face("Synth Crag", |f| {
+                f.types(CardTypeMask::LAND);
+                f.draft
+                    .abilities
+                    .push(AbilityDef::Activated(ActivatedAbility {
+                        id: "mdfc_mana_r".to_string(),
+                        cost: vec![CostDef::TapSelf],
+                        targets: vec![],
+                        effect: vec![effect_step(
+                            EffectOp::AddMana {
+                                production: ManaProduction::Fixed {
+                                    symbols: smallvec::smallvec![ManaColor::R],
+                                },
+                                restriction: None,
+                                restriction_spec: None,
+                                retain_until_eot: false,
+                                delayed_rider: None,
+                            },
+                            Selector::None,
+                            None,
+                        )],
+                        modal: None,
+                        timing: Timing::Mana,
+                        is_mana: true,
+                        activation_restrictions: vec![],
+                        activation_condition: None,
+                        activator_who: None,
+                        power_up_reduction: false,
+                        x_cant_be_zero: false,
+                        activation_cost_reduction: None,
+                        activation_zones: ZoneMask::BATTLEFIELD,
+                        cost_keyword: None,
+                        intrinsic: true,
+                        text: None,
+                        grant_condition: None,
+                        x_spend_colors: ColorMask::empty(),
+                        x_colored_only: false,
+                        x_max_one_per_color: false,
+                        span: Span::default(),
+                    }));
+            });
+    });
+
+    // Spell attempting to move any card from Graveyard to Battlefield (CR 307.4 must block Sorcery-front MDFC).
+    let reanimate_any = b.add_card("synth_reanim_3074", "Synth Reclaim", |c| {
+        c.mana_cost("{0}")
+            .types(CardTypeMask::SORCERY)
+            .spell_effect(
+                vec![TargetSpec {
+                    kind: TargetKind::Object,
+                    filter: ObjectFilter {
+                        zones: ZoneMask::GRAVEYARD,
+                        ..Default::default()
+                    },
+                    player: None,
+                    min: 1,
+                    max: 1,
+                    same_owner: false,
+                    condition: None,
+                    other_target: false,
+                    divide_total: None,
+                    with_single_target: false,
+                    dynamic_count: None,
+                    dynamic_up_to: false,
+                    max_total_mana_value: None,
+                    also_spells: false,
+                    per_opponent: false,
+                    different_controllers: false,
+                    chosen_by_event_player: false,
+                    shares_card_type_with_target: None,
+                    zones: ZoneMask::empty(),
+                }],
+                vec![effect_step(
+                    EffectOp::Move {
+                        from: Some(Zone::Graveyard),
+                        to: Some(Zone::Battlefield),
+                        select: Default::default(),
+                        tapped: false,
+                        under_your_control: true,
+                        topmost_only: false,
+                        may_shuffle: false,
+                        position: None,
+                        from_top: None,
+                        library_choice_by: None,
+                        random_order: false,
+                        entered_transformed: false,
+                        entered_flipped: false,
+                        enters_tapped_and_attacking: false,
+                        as_enchantment_only: false,
+                        unearth: false,
+                        with_counters: None,
+                        attached_to: None,
+                        condition: None,
+                        choose_at_random_from_exiled_with_self: false,
+                        leave_chosen_in_graveyard_rest_to_hand: false,
+                        split_exiled_cost_cards_to_bottom_and_battlefield: false,
+                    },
+                    Selector::Target { index: 0 },
+                    None,
+                )],
+            );
+    });
+    let db = b.build_db();
+
+    let (cfg, decks) = common::guaranteed_decks(
+        &[&[mdfc, mdfc, reanimate_any], &[plains]],
+        &[],
+        3,
+        GameConfig::standard_1v1(),
+    );
+    let mut drv = SessionDriver::new(db, cfg, decks, 3074).unwrap();
+    drv.keep_all_hands();
+    drv.advance_to(1, GamePhase::Main1, 16);
+
+    let mdfc_hand = drv.find_hand_object(PlayerId(0), mdfc).unwrap();
+    // Playing face 0 (Sorcery) as a land must be rejected.
+    let err = drv
+        .step(
+            PlayerId(0),
+            Action::PlayLand {
+                object: mdfc_hand,
+                from_zone: Zone::Hand,
+                face_index: 0,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::IllegalAction(_)));
+
+    // Playing face 1 (Land) must move the MDFC onto the battlefield with Land types.
+    drv.step(
+        PlayerId(0),
+        Action::PlayLand {
+            object: mdfc_hand,
+            from_zone: Zone::Hand,
+            face_index: 1,
+        },
+    )
+    .unwrap();
+    let mdfc_bf = drv
+        .find_battlefield_object(PlayerId(0), mdfc)
+        .expect("MDFC back-face Land must enter battlefield");
+    assert!(drv.find_hand_object(PlayerId(0), mdfc).is_some()); // second copy still in hand
+    assert_eq!(
+        drv.session
+            .state()
+            .object(mdfc_bf)
+            .unwrap()
+            .active_face_index(),
+        1
+    );
+    let bf_eval = drv.session.state().evaluate_board().get(mdfc_bf).unwrap();
+    assert!(bf_eval.types.contains(CardTypeMask::LAND));
+    assert!(!bf_eval.types.contains(CardTypeMask::SORCERY));
+
+    // Tap the MDFC land for {R} to cast the second copy's face-0 Sorcery half.
+    let mdfc_hand2 = drv.find_hand_object(PlayerId(0), mdfc).unwrap();
+    drv.cast_from_hand(PlayerId(0), mdfc, vec![]).unwrap();
+    drv.resolve_all_stack(8);
+    assert!(drv.session.state().object(mdfc_hand2).is_none());
+    assert_eq!(drv.session.state().player(PlayerId(0)).unwrap().life, 22);
+
+    // The cast copy is in Graveyard with face 0 (Sorcery) active; CR 307.4 must keep it in Graveyard.
+    let mdfc_gy = drv
+        .find_graveyard_object(PlayerId(0), mdfc)
+        .expect("resolved MDFC sorcery must be in graveyard");
+    drv.cast_from_hand(
+        PlayerId(0),
+        reanimate_any,
+        vec![TargetRef::Object { id: mdfc_gy }],
+    )
+    .unwrap();
+    drv.resolve_all_stack(8);
+    assert!(
+        drv.find_graveyard_object(PlayerId(0), mdfc).is_some(),
+        "CR 307.4: Sorcery-front MDFC must not enter battlefield from graveyard"
+    );
+    // Only the original MDFC land copy is on the battlefield.
+    let bf_count = drv
+        .session
+        .state()
+        .player(PlayerId(0))
+        .unwrap()
+        .battlefield
+        .iter()
+        .filter(|&&id| {
+            drv.session
+                .state()
+                .object(id)
+                .is_some_and(|o| o.card_def == mdfc)
+        })
+        .count();
+    assert_eq!(bf_count, 1);
+}

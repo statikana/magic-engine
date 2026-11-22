@@ -5,7 +5,9 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{SessionDriver, SynthBundleBuilder, effect_step, simple_trigger, target_player};
+use common::{
+    SessionDriver, SynthBundleBuilder, effect_step, simple_trigger, target_creature, target_player,
+};
 use mtg_engine::{
     Action, ChoiceAnswer, ChoiceRequest, DecisionState, DeckSpec, GameConfig, PlayerId, TargetRef,
 };
@@ -1091,4 +1093,131 @@ fn synth_cr605_triggered_mana_abilities_and_multipliers() {
         3,
         "1 Forest + 2x TriggerMultiplier ManaFlare = 3 Green mana"
     );
+}
+
+#[test]
+fn synth_cr603_7_delayed_trigger_preserves_bind_as_bindings() {
+    let mut b = SynthBundleBuilder::new();
+    let plains = b.add_synth_basic_land("synth_pl_dtbind", "Synth Plains", "Plains", ManaColor::W);
+    let bear = b.add_synth_vanilla("synth_bear_dtbind", "Synth Bear", "{0}", 2, 2);
+    let blink = b.add_card("synth_blink_dtbind", "Synth Delayed Blink", |c| {
+        c.mana_cost("{0}")
+            .types(CardTypeMask::INSTANT)
+            .spell_effect(
+                vec![target_creature()],
+                vec![
+                    mtg_ir::EffectStep {
+                        bind_as: Some("ex".into()),
+                        ..effect_step(
+                            EffectOp::Exile {
+                                select: Default::default(),
+                                duration: None,
+                                until_source_leaves: false,
+                                until_opponent_becomes_monarch: false,
+                                exile_all_except_bottom: false,
+                                face_down: false,
+                                look_only: false,
+                                exile_with_counters: None,
+                            },
+                            Selector::Target { index: 0 },
+                            None,
+                        )
+                    },
+                    effect_step(
+                        EffectOp::DelayedTrigger {
+                            delayed: Some(DelayedTriggerPayload {
+                                trigger: Box::new(simple_trigger(
+                                    EventKind::PhaseBegin,
+                                    EventFilter {
+                                        detail: Some(EventDetail::Phase {
+                                            phase: Some(GamePhase::EndStep),
+                                            any_main_phase: false,
+                                            enchanted_controller_upkeep: false,
+                                            enchanted_player_upkeep: false,
+                                            enchanted_opponent_end_step: false,
+                                            phase_chosen_player: false,
+                                            turn_filter: None,
+                                        }),
+                                        ..Default::default()
+                                    },
+                                )),
+                                effect: vec![effect_step(
+                                    EffectOp::Move {
+                                        from: Some(Zone::Exile),
+                                        to: Some(Zone::Battlefield),
+                                        select: Default::default(),
+                                        tapped: false,
+                                        under_your_control: true,
+                                        topmost_only: false,
+                                        may_shuffle: false,
+                                        position: None,
+                                        from_top: None,
+                                        library_choice_by: None,
+                                        random_order: false,
+                                        entered_transformed: false,
+                                        entered_flipped: false,
+                                        enters_tapped_and_attacking: false,
+                                        as_enchantment_only: false,
+                                        unearth: false,
+                                        with_counters: None,
+                                        attached_to: None,
+                                        condition: None,
+                                        choose_at_random_from_exiled_with_self: false,
+                                        leave_chosen_in_graveyard_rest_to_hand: false,
+                                        split_exiled_cost_cards_to_bottom_and_battlefield: false,
+                                    },
+                                    Selector::Binding { name: "ex".into() },
+                                    None,
+                                )],
+                                targets: vec![],
+                                next_turn: false,
+                            }),
+                            inline_delayed: None,
+                            return_target_and_sacrificed_at_upkeep: false,
+                        },
+                        Selector::None,
+                        None,
+                    ),
+                ],
+            );
+    });
+    let db = b.build_db();
+    let (cfg, decks) = common::guaranteed_decks(
+        &[&[bear, blink], &[plains]],
+        &[],
+        2,
+        GameConfig::standard_1v1(),
+    );
+    let mut drv = SessionDriver::new(db, cfg, decks, 603701).unwrap();
+    drv.keep_all_hands();
+    drv.advance_to(1, GamePhase::Main1, 16);
+
+    drv.cast_from_hand(PlayerId(0), bear, vec![]).unwrap();
+    drv.resolve_all_stack(8);
+    let b_bf = drv.find_battlefield_object(PlayerId(0), bear).unwrap();
+
+    drv.cast_from_hand(PlayerId(0), blink, vec![TargetRef::Object { id: b_bf }])
+        .unwrap();
+    drv.resolve_all_stack(8);
+    assert!(
+        drv.find_battlefield_object(PlayerId(0), bear).is_none(),
+        "Bear must be exiled during Main1"
+    );
+    assert!(
+        drv.session
+            .state()
+            .player(PlayerId(0))
+            .unwrap()
+            .exile
+            .iter()
+            .any(|&id| drv.session.state().object(id).unwrap().card_def == bear),
+        "Bear must be in exile"
+    );
+
+    // Advance to Turn 2 Main1 -> Turn 1 EndStep delayed trigger fires and returns Bear via binding "ex"!
+    drv.advance_to(2, GamePhase::Main1, 32);
+    let returned = drv
+        .find_battlefield_object(PlayerId(0), bear)
+        .expect("CR 603.7: delayed trigger must preserve bind_as binding and return exiled Bear");
+    assert!(returned.generation > b_bf.generation);
 }

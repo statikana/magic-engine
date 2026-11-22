@@ -526,6 +526,11 @@ pub(crate) fn exec_delayed_trigger(
         .into_iter()
         .collect();
     let x_value = state.resolution_vms().last().map_or(0, |v| v.x_value);
+    let bindings = state
+        .resolution_frames()
+        .last()
+        .map(|f| f.bindings.clone())
+        .unwrap_or_default();
 
     if let Some(payload) = delayed {
         let expiry = if payload.next_turn {
@@ -565,6 +570,7 @@ pub(crate) fn exec_delayed_trigger(
                 expiry,
                 watched_objects: watched.clone(),
                 x_value,
+                bindings: bindings.clone(),
             },
         );
     } else if let Some(inline) = inline_delayed {
@@ -613,6 +619,7 @@ pub(crate) fn exec_delayed_trigger(
                     expiry,
                     watched_objects: watched,
                     x_value,
+                    bindings,
                 },
             );
         }
@@ -707,6 +714,7 @@ pub(crate) fn exec_delayed_tap_mana_trigger(
             expiry: DelayedExpiry::ThisTurn,
             watched_objects: SmallVec::new(),
             x_value: 0,
+            bindings: Vec::new(),
         },
     );
     Ok(StepExecOutcome::Done)

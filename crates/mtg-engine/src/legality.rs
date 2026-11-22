@@ -1665,6 +1665,7 @@ fn can_cast_spell_option_with_bound(
     ) {
         face_opts.is_face_down = false;
     }
+    face_opts.zone = Zone::Stack;
     face_opts.face_index = opt.face_idx;
     face_opts.fused = opt.fused;
     face_opts.cleaved = opt.cleaved;

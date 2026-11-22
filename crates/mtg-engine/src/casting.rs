@@ -1062,6 +1062,7 @@ pub fn begin_cast_spell(
             obj.zone
         )));
     }
+    let obj_card_def = obj.card_def;
     let Some(opt) = can_cast_spell_option(state, caster, object, option_id) else {
         return Err(EngineError::IllegalAction(format!(
             "cannot cast {object:?} with option_id {option_id} from {from_zone:?}"
@@ -1070,7 +1071,7 @@ pub fn begin_cast_spell(
 
     let kicked_tags = {
         let mut tags = SmallVec::new();
-        if let Some(card) = state.db().get(obj.card_def)
+        if let Some(card) = state.db().get(obj_card_def)
             && let Some(face) = card.faces.get(usize::from(opt.face_idx))
         {
             for ab in &face.abilities {
@@ -1107,6 +1108,11 @@ pub fn begin_cast_spell(
         None
     };
 
+    let eff_def = state
+        .rare(object)
+        .and_then(|r| r.copiable.as_deref())
+        .map_or(obj_card_def, |c| c.card_def);
+
     // Move card onto Stack (CR 601.2a)
     let mut mv_opts = MoveRawOptions {
         to_player: Some(caster),
@@ -1118,11 +1124,42 @@ pub fn begin_cast_spell(
         opt.alt_kind,
         AltCastKind::MorphFaceDown | AltCastKind::DisguiseFaceDown
     ) {
+        let f0 = state.db().get(eff_def).and_then(|c| c.faces.first());
+        let (kind, kw) = if opt.alt_kind == AltCastKind::DisguiseFaceDown {
+            (
+                FaceDownKind::Disguise,
+                f0.and_then(|f| find_keyword(f, state.db(), "disguise")),
+            )
+        } else if let Some(mega_kw) = f0.and_then(|f| find_keyword(f, state.db(), "megamorph")) {
+            (FaceDownKind::Megamorph, Some(mega_kw))
+        } else {
+            (
+                FaceDownKind::Morph,
+                f0.and_then(|f| find_keyword(f, state.db(), "morph")),
+            )
+        };
+        let turn_up_mana_cost = kw.and_then(|k| k.cost.clone());
+        let turn_up_cost_defs = kw
+            .map(|k| {
+                if turn_up_mana_cost.is_some() {
+                    k.cost_defs
+                        .iter()
+                        .filter(|c| !matches!(c, CostDef::Mana { .. }))
+                        .cloned()
+                        .collect()
+                } else {
+                    k.cost_defs.clone()
+                }
+            })
+            .unwrap_or_default();
         mv_opts.enter_face_down = Some(FaceDownSpec {
-            kind: if opt.alt_kind == AltCastKind::DisguiseFaceDown {
-                FaceDownKind::Disguise
+            kind,
+            turn_up_mana_cost,
+            turn_up_cost_defs,
+            ward_cost: if kind == FaceDownKind::Disguise {
+                Some(ManaCost::parse("{2}"))
             } else {
-                FaceDownKind::Morph
+                None
             },
             ..Default::default()
         });
@@ -4263,9 +4300,39 @@ pub fn apply_special_action(
                 )?;
             }
             for c in &fd.turn_up_cost_defs {
+                if fd.turn_up_mana_cost.is_some() && matches!(c, CostDef::Mana { .. }) {
+                    continue;
+                }
                 let _ = execute_non_mana_cost_step(state, player, object, c, &[], None, None)?;
             }
             turn_face_up(state, object)?;
+            if fd.kind == FaceDownKind::Megamorph
+                && let Some(plus_cid) = state.db().counter_id("+1/+1")
+            {
+                match crate::replace::resolve_put_counters(
+                    state,
+                    object,
+                    plus_cid,
+                    1,
+                    Some(player),
+                    Some(object),
+                )? {
+                    crate::replace::ReplacementResult::Resolved(outcome) => {
+                        crate::effects::counters_mods::apply_resolved_put_counters(
+                            state, &outcome, player,
+                        );
+                    }
+                    crate::replace::ReplacementResult::Paused { .. } => {
+                        state.set_pending_replacement_resume(Some(
+                            crate::state::ReplacementResumeHook::MegamorphTurnFaceUp {
+                                object,
+                                player,
+                            },
+                        ));
+                        return Ok(());
+                    }
+                }
+            }
             emit_event(
                 state,
                 AtomicEventKind::TurnedFaceUp {
@@ -4427,6 +4494,9 @@ pub fn apply_special_action(
                 )?;
             }
             for c in &pk.cost_defs {
+                if pk.cost.is_some() && matches!(c, CostDef::Mana { .. }) {
+                    continue;
+                }
                 let _ = execute_non_mana_cost_step(state, player, object, c, &[], None, None)?;
             }
             let mv = move_object(state, object, Zone::Exile, MoveRawOptions::default(), None)?;

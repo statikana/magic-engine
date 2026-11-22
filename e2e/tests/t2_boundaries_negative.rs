@@ -1161,6 +1161,22 @@ fn t2_f06_02_commander_cast_from_hand_does_not_add_or_increment_tax() {
     drv.pass_priority();
     drv.pass_priority();
 
+    match drv.decision() {
+        DecisionState::Prompt {
+            request: ChoiceRequest::YesNo { prompt_id, .. },
+        } => {
+            drv.step(
+                PlayerId(0),
+                Action::Answer {
+                    prompt_id,
+                    answer: ChoiceAnswer::YesNo { value: false },
+                },
+            )
+            .unwrap();
+        }
+        other => panic!("expected CR 903.9b YesNo prompt on commander bounce, got {other:?}"),
+    }
+
     // Turn 5: Islands untap; in Hand, casting commander costs {U} (NOT {2}{U}!), even after 1 command cast!
     drv.advance_to_preserving(5, GamePhase::Main1, 64, &[(cmd, 1)])
         .unwrap();
@@ -1337,7 +1353,26 @@ fn t2_f06_04_face_down_permanent_characteristics_and_turn_face_up() {
     );
     assert_eq!(bd.colors, ColorMask::empty());
 
+    // Turn 5: all 3 Forests are tapped -> TurnFaceUp for {G} must fail with 0 mana available.
+    assert!(
+        drv.step_unchecked(
+            PlayerId(0),
+            Action::SpecialAction {
+                kind: mtg_engine::SpecialActionKind::TurnFaceUp { object: m_bf },
+            },
+        )
+        .is_err(),
+        "CR 702.37e: TurnFaceUp for {{G}} must fail when 0 mana is available"
+    );
+
     drv.advance_to(7, GamePhase::Main1, 64).unwrap();
+    let tapped_before = drv.session.view_model(None).players[0]
+        .battlefield
+        .iter()
+        .filter(|o| o.types.contains(CardTypeMask::LAND) && o.tapped)
+        .count();
+    assert_eq!(tapped_before, 0);
+
     drv.step(
         PlayerId(0),
         Action::SpecialAction {
@@ -1345,6 +1380,15 @@ fn t2_f06_04_face_down_permanent_characteristics_and_turn_face_up() {
         },
     )
     .unwrap();
+    let tapped_after = drv.session.view_model(None).players[0]
+        .battlefield
+        .iter()
+        .filter(|o| o.types.contains(CardTypeMask::LAND) && o.tapped)
+        .count();
+    assert_eq!(
+        tapped_after, 1,
+        "CR 702.37e: TurnFaceUp for {{G}} must tap 1 Forest"
+    );
     let bd_up = drv.session.hover_breakdown(None, m_bf).unwrap();
     assert_eq!(
         bd_up.evaluated_pt,
@@ -3147,7 +3191,7 @@ fn t2_f15_05_determinize_empty_opponent_hand_and_library() {
 fn build_diff_bin_t2(dir: &TempDir) -> std::path::PathBuf {
     let mut b = SynthBundleBuilder::new();
     b.add_synth_basic_land("synth_plains_t2d", "Synth Plains", "Plains", ManaColor::W);
-    b.add_synth_vanilla_creature("synth_bear_t2d", "Synth Bear", "{1}{W}", 2, 2);
+    b.add_synth_vanilla_creature("synth_bear_t2d", "Synth Bear", "{0}", 2, 2);
     let j = dir.child("b.json");
     let bin = dir.child("b.bin");
     std::fs::write(&j, serde_json::to_string(&b.build_bundle()).unwrap()).unwrap();
@@ -3205,47 +3249,91 @@ fn t2_f16_02_diff_test_catches_initial_library_order_mismatch() {
 fn t2_f16_03_diff_test_catches_battlefield_counters_mismatch() {
     let tmp = TempDir::new("t2_f16_03");
     let bin = build_diff_bin_t2(&tmp);
-    let mut rng = RngState::mulberry32(42);
-    let mut lib0 = vec!["synth_plains_t2d".to_string(); 60];
-    rng.shuffle(&mut lib0);
-    let mut lib1 = vec!["synth_plains_t2d".to_string(); 60];
-    rng.shuffle(&mut lib1);
-    let p0 = serde_json::json!({
-        "seat": 0, "life": 20, "lost": false, "poison": 0, "energy": 0,
-        "manaPool": [0, 0, 0, 0, 0, 0],
-        "zoneCounts": { "library": 53, "hand": 7, "battlefield": 0, "graveyard": 0, "exile": 0, "command": 0 },
-        "handOracleIds": vec!["synth_plains_t2d"; 7],
-        "battlefield": [{
-            "oracleId": "synth_bear_t2d", "tapped": false, "pt": [3, 3],
+    let lib0 = vec!["synth_bear_t2d".to_string(); 60];
+    let lib1 = vec!["synth_plains_t2d".to_string(); 60];
+
+    let mk_p = |seat: u8, hand: usize, bf_count: usize, oracle: &str, bf: serde_json::Value| {
+        serde_json::json!({
+            "seat": seat, "life": 20, "lost": false, "poison": 0, "energy": 0,
+            "manaPool": [0, 0, 0, 0, 0, 0],
+            "zoneCounts": { "library": 53, "hand": hand, "battlefield": bf_count, "graveyard": 0, "exile": 0, "command": 0 },
+            "handOracleIds": vec![oracle; hand],
+            "battlefield": bf
+        })
+    };
+
+    let p0_init = mk_p(0, 7, 0, "synth_bear_t2d", serde_json::json!([]));
+    let p0_cast = mk_p(0, 6, 0, "synth_bear_t2d", serde_json::json!([]));
+    let p0_bad_counters = mk_p(
+        0,
+        6,
+        1,
+        "synth_bear_t2d",
+        serde_json::json!([{
+            "oracleId": "synth_bear_t2d", "tapped": false, "pt": [2, 2],
             "types": ["Creature"], "keywords": [], "counters": [["+1/+1", 99]],
             "damageMarked": 0, "attachedToOracleId": null
-        }]
+        }]),
+    );
+    let p1 = mk_p(1, 7, 0, "synth_plains_t2d", serde_json::json!([]));
+
+    let mulligan_digest = serde_json::json!({
+        "turnNumber": 1, "activeSeat": 0, "prioritySeat": 0,
+        "phase": "main1", "stackDepth": 0, "pendingPromptKind": "mulligan",
+        "players": [p0_init.clone(), p1.clone()]
     });
-    let p1 = serde_json::json!({
-        "seat": 1, "life": 20, "lost": false, "poison": 0, "energy": 0,
-        "manaPool": [0, 0, 0, 0, 0, 0],
-        "zoneCounts": { "library": 53, "hand": 7, "battlefield": 0, "graveyard": 0, "exile": 0, "command": 0 },
-        "handOracleIds": vec!["synth_plains_t2d"; 7],
-        "battlefield": []
-    });
-    let digest = serde_json::json!({
+    let main1_digest = serde_json::json!({
         "turnNumber": 1, "activeSeat": 0, "prioritySeat": 0,
         "phase": "main1", "stackDepth": 0, "pendingPromptKind": null,
-        "players": [p0, p1]
+        "players": [p0_init, p1.clone()]
     });
+    let stack_p0_digest = serde_json::json!({
+        "turnNumber": 1, "activeSeat": 0, "prioritySeat": 0,
+        "phase": "main1", "stackDepth": 1, "pendingPromptKind": null,
+        "players": [p0_cast.clone(), p1.clone()]
+    });
+    let stack_p1_digest = serde_json::json!({
+        "turnNumber": 1, "activeSeat": 0, "prioritySeat": 1,
+        "phase": "main1", "stackDepth": 1, "pendingPromptKind": null,
+        "players": [p0_cast, p1.clone()]
+    });
+    let bad_counters_digest = serde_json::json!({
+        "turnNumber": 1, "activeSeat": 0, "prioritySeat": 0,
+        "phase": "main1", "stackDepth": 0, "pendingPromptKind": null,
+        "players": [p0_bad_counters, p1]
+    });
+
     let trace = serde_json::json!({
         "formatVersion": 1, "compilerVersion": 46, "seed": 42, "postInitRngState": 42,
         "rules": { "startingLife": 20, "commander": false, "freeFirstMulligan": false },
         "seats": [
-            { "seat": 0, "deckId": "s0", "commanders": [], "libraryOrderInitial": lib0, "handInitial": [] },
-            { "seat": 1, "deckId": "s1", "commanders": [], "libraryOrderInitial": lib1, "handInitial": [] }
+            { "seat": 0, "deckId": "s0", "commanders": [], "libraryOrderInitial": lib0, "handInitial": vec!["synth_bear_t2d"; 7] },
+            { "seat": 1, "deckId": "s1", "commanders": [], "libraryOrderInitial": lib1, "handInitial": vec!["synth_plains_t2d"; 7] }
         ],
-        "steps": [{ "stepIndex": 0, "actorSeat": 0, "action": { "type": "mulligan_keep" }, "objectLocators": {}, "digestAfter": digest }]
+        "steps": [
+            { "stepIndex": 0, "actorSeat": 0, "action": { "type": "mulligan_keep" }, "objectLocators": {}, "digestAfter": mulligan_digest },
+            { "stepIndex": 1, "actorSeat": 1, "action": { "type": "mulligan_keep" }, "objectLocators": {}, "digestAfter": main1_digest },
+            {
+                "stepIndex": 2,
+                "actorSeat": 0,
+                "action": { "type": "cast_spell", "instanceId": "obj_0", "optionId": "normal" },
+                "objectLocators": { "obj_0": { "seat": 0, "zone": "hand", "zoneIndex": 0, "oracleId": "synth_bear_t2d" } },
+                "digestAfter": stack_p0_digest
+            },
+            { "stepIndex": 3, "actorSeat": 0, "action": { "type": "pass_priority" }, "objectLocators": {}, "digestAfter": stack_p1_digest },
+            { "stepIndex": 4, "actorSeat": 1, "action": { "type": "pass_priority" }, "objectLocators": {}, "digestAfter": bad_counters_digest }
+        ]
     });
     let rep = tmp.child("bad_bf.json");
     std::fs::write(&rep, serde_json::to_string(&trace).unwrap()).unwrap();
     let res = run_diff_test(&bin, &rep);
     assert!(!res.success);
+    assert!(
+        res.stderr.contains("counters") || res.stdout.contains("counters"),
+        "diff-test must report counters divergence, got stdout:\n{}\nstderr:\n{}",
+        res.stdout,
+        res.stderr
+    );
 }
 
 #[test]
@@ -3266,15 +3354,23 @@ fn t2_f16_05_diff_test_catches_unallowlisted_priority_divergence() {
     rng.shuffle(&mut lib0);
     let mut lib1 = vec!["synth_plains_t2d".to_string(); 60];
     rng.shuffle(&mut lib1);
-    let p0 = serde_json::json!({
-        "seat": 0, "life": 20, "lost": false, "poison": 0, "energy": 0,
-        "manaPool": [0, 0, 0, 0, 0, 0],
-        "zoneCounts": { "library": 53, "hand": 7, "battlefield": 0, "graveyard": 0, "exile": 0, "command": 0 },
-        "handOracleIds": vec!["synth_plains_t2d"; 7],
-        "battlefield": []
+    let mk_p = |seat: u8| {
+        serde_json::json!({
+            "seat": seat, "life": 20, "lost": false, "poison": 0, "energy": 0,
+            "manaPool": [0, 0, 0, 0, 0, 0],
+            "zoneCounts": { "library": 53, "hand": 7, "battlefield": 0, "graveyard": 0, "exile": 0, "command": 0 },
+            "handOracleIds": vec!["synth_plains_t2d"; 7],
+            "battlefield": []
+        })
+    };
+    let p0 = mk_p(0);
+    let p1 = mk_p(1);
+    let mulligan_digest = serde_json::json!({
+        "turnNumber": 1, "activeSeat": 0, "prioritySeat": 0,
+        "phase": "main1", "stackDepth": 0, "pendingPromptKind": "mulligan",
+        "players": [p0.clone(), p1.clone()]
     });
-    let p1 = p0.clone();
-    let digest = serde_json::json!({
+    let bad_prio_digest = serde_json::json!({
         "turnNumber": 1, "activeSeat": 0, "prioritySeat": 1,
         "phase": "main1", "stackDepth": 0, "pendingPromptKind": null,
         "players": [p0, p1]
@@ -3286,11 +3382,21 @@ fn t2_f16_05_diff_test_catches_unallowlisted_priority_divergence() {
             { "seat": 0, "deckId": "s0", "commanders": [], "libraryOrderInitial": lib0, "handInitial": [] },
             { "seat": 1, "deckId": "s1", "commanders": [], "libraryOrderInitial": lib1, "handInitial": [] }
         ],
-        "steps": [{ "stepIndex": 0, "actorSeat": 0, "action": { "type": "mulligan_keep" }, "objectLocators": {}, "digestAfter": digest }]
+        "steps": [
+            { "stepIndex": 0, "actorSeat": 0, "action": { "type": "mulligan_keep" }, "objectLocators": {}, "digestAfter": mulligan_digest },
+            { "stepIndex": 1, "actorSeat": 1, "action": { "type": "mulligan_keep" }, "objectLocators": {}, "digestAfter": bad_prio_digest }
+        ]
     });
     let rep = tmp.child("bad_prio.json");
     std::fs::write(&rep, serde_json::to_string(&trace).unwrap()).unwrap();
-    assert!(!run_diff_test(&bin, &rep).success);
+    let res = run_diff_test(&bin, &rep);
+    assert!(!res.success);
+    assert!(
+        res.stderr.contains("priority_seat") || res.stdout.contains("priority_seat"),
+        "diff-test must report priority_seat divergence, got stdout:\n{}\nstderr:\n{}",
+        res.stdout,
+        res.stderr
+    );
 }
 
 // ============================================================================

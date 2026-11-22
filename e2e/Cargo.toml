@@ -10,9 +10,7 @@ description = "Standalone opaque-box E2E test suite for mtg-engine, mtg-ir, and 
 
 [features]
 default = []
-# Enable once Milestone M3 adds `verify-layer-cache` to `crates/mtg-engine/Cargo.toml`:
-# verify-layer-cache = ["mtg-engine/verify-layer-cache"]
-verify-layer-cache = []
+verify-layer-cache = ["mtg-engine/verify-layer-cache"]
 # Enable once Milestone M5 adds `decision_info`, `from_replay`, `snapshot_bytes`, `from_snapshot`:
 m5-session-ext = []
 

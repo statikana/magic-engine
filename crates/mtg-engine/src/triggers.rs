@@ -243,6 +243,8 @@ pub struct PendingTrigger {
     pub last_tapped_mana_colors: SmallVec<[ManaColor; 6]>,
     pub is_look_back: bool,
     pub x_value: u32,
+    #[serde(default)]
+    pub bindings: Vec<ResolutionBinding>,
 }
 
 /// Expiration rule for delayed triggers (`CR 603.7`).
@@ -280,6 +282,8 @@ pub struct DelayedTriggerEntry {
     pub expiry: DelayedExpiry,
     pub watched_objects: SmallVec<[ObjectId; 4]>,
     pub x_value: u32,
+    #[serde(default)]
+    pub bindings: Vec<ResolutionBinding>,
 }
 
 /// Reflexive trigger queued during step resolution (`CR 603.12`).
@@ -356,6 +360,7 @@ struct TriggerCandidate {
     delayed_id: Option<u32>,
     delayed_expiry: Option<DelayedExpiry>,
     x_value: u32,
+    bindings: Vec<ResolutionBinding>,
 }
 
 #[derive(Clone)]
@@ -970,6 +975,7 @@ fn collect_trigger_candidates(
             delayed_id: Some(dt.id),
             delayed_expiry: Some(dt.expiry),
             x_value: dt.x_value,
+            bindings: dt.bindings.clone(),
         });
     }
 
@@ -1069,6 +1075,7 @@ fn collect_lookback_abilities_from_lki(
                         delayed_id: None,
                         delayed_expiry: None,
                         x_value: 0,
+                        bindings: Vec::new(),
                     });
                 }
             }
@@ -1110,6 +1117,7 @@ fn collect_lookback_abilities_from_lki(
                     delayed_id: None,
                     delayed_expiry: None,
                     x_value: 0,
+                    bindings: Vec::new(),
                 });
             }
         }
@@ -1176,6 +1184,7 @@ fn push_ability_candidate(
         delayed_id: None,
         delayed_expiry: None,
         x_value: 0,
+        bindings: Vec::new(),
     });
 }
 
@@ -1243,6 +1252,7 @@ fn push_granted_ability_candidates(
                         delayed_id: None,
                         delayed_expiry: None,
                         x_value: 0,
+                        bindings: Vec::new(),
                     });
                 }
             }
@@ -1288,6 +1298,7 @@ fn push_granted_ability_candidates(
                         delayed_id: None,
                         delayed_expiry: None,
                         x_value: 0,
+                        bindings: Vec::new(),
                     });
                 }
             }
@@ -1357,6 +1368,7 @@ fn push_granted_ability_candidates(
                     delayed_id: None,
                     delayed_expiry: None,
                     x_value: 0,
+                    bindings: Vec::new(),
                 });
             }
             GrantedAbilityEntry::IntrinsicBasicMana { .. } => {}
@@ -4063,6 +4075,7 @@ fn event_matches_pattern(
         delayed_id: None,
         delayed_expiry: None,
         x_value: 0,
+        bindings: Vec::new(),
     };
 
     let subs = extract_matching_subevents(state, &dummy_cand.trigger, event);
@@ -4168,6 +4181,18 @@ fn record_pending_trigger(
         TriggerMode::Stack
     };
 
+    let event_object = if matches!(cand.kind, TriggerSourceKind::DynamicWard { .. }) {
+        sub.stack_item
+            .and_then(|sid| state.stack_entries().iter().find(|se| se.id == sid))
+            .and_then(|se| match se.kind {
+                StackEntryKind::Spell { object } => Some(object),
+                _ => None,
+            })
+            .or(sub.event_new_id.or(sub.event_object))
+    } else {
+        sub.event_new_id.or(sub.event_object)
+    };
+
     for _ in 0..count {
         let order = state.allocate_trigger_order();
         state.pending_triggers_mut().push(PendingTrigger {
@@ -4182,7 +4207,7 @@ fn record_pending_trigger(
             targets: cand.targets.clone(),
             effect: cand.effect.clone(),
             modal: cand.modal.clone(),
-            event_object: sub.event_new_id.or(sub.event_object),
+            event_object,
             event_lki: sub.event_lki.clone(),
             event_player: sub.event_player,
             event_amount: sub.event_amount,
@@ -4190,6 +4215,7 @@ fn record_pending_trigger(
             last_tapped_mana_colors: sub.last_tapped_mana_colors.clone(),
             is_look_back: cand.is_look_back,
             x_value: cand.x_value,
+            bindings: cand.bindings.clone(),
         });
     }
     true
@@ -4703,6 +4729,7 @@ pub fn check_state_triggers(state: &mut GameState) -> usize {
                     delayed_id: None,
                     delayed_expiry: None,
                     x_value: 0,
+                    bindings: Vec::new(),
                 });
             }
         }
@@ -4742,6 +4769,7 @@ pub fn check_state_triggers(state: &mut GameState) -> usize {
             last_tapped_mana_colors: SmallVec::new(),
             is_look_back: false,
             x_value: 0,
+            bindings: Vec::new(),
         });
     }
     added
@@ -5109,7 +5137,7 @@ fn push_pending_trigger_to_stack(state: &mut GameState, t: &PendingTrigger) -> S
             last_tapped_mana_colors: t.last_tapped_mana_colors.clone(),
             is_look_back: t.is_look_back,
             x_value: t.x_value,
-            bindings: Vec::new(),
+            bindings: t.bindings.clone(),
         },
     );
     state.mark_dirty(DirtyMask::TOPOLOGY);
@@ -6211,6 +6239,7 @@ mod tests {
                 expiry: DelayedExpiry::OneShot,
                 watched_objects: SmallVec::new(),
                 x_value: 0,
+                bindings: Vec::new(),
             },
         );
         emit_event(
@@ -6455,6 +6484,7 @@ mod tests {
                 expiry: DelayedExpiry::ThisTurn,
                 watched_objects: SmallVec::new(),
                 x_value: 0,
+                bindings: Vec::new(),
             },
         );
 
@@ -9530,6 +9560,7 @@ mod tests {
             last_tapped_mana_colors: SmallVec::new(),
             is_look_back: false,
             x_value: 0,
+            bindings: Vec::new(),
         };
 
         // 1. Multi-symbol Fixed {R}{R} with redundant step.amount = 2 adds 2 {R} (NOT 4!).
@@ -9688,6 +9719,7 @@ mod tests {
                 last_tapped_mana_colors: SmallVec::new(),
                 is_look_back,
                 x_value: 0,
+                bindings: Vec::new(),
             }
         };
 

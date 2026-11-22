@@ -1612,3 +1612,348 @@ fn synth_cr104_win_loss_overrides_and_max_hand_size_rules() {
         assert_eq!(drv.session.view_model(None).players[0].max_hand_size, None);
     }
 }
+
+#[test]
+fn synth_cr601_instant_speed_multiface_casting_legality() {
+    use mtg_ir::CardLayout;
+
+    let mut b = SynthBundleBuilder::new();
+    let plains =
+        b.add_synth_basic_land("synth_plains_601m", "Synth Plains", "Plains", ManaColor::W);
+
+    // 1) ModalDfc: Face 0 = Creature, Face 1 = Instant
+    let mdfc = b.add_card("synth_mdfc_601m", "Synth Sentry // Synth Ward", |c| {
+        c.layout(CardLayout::ModalDfc)
+            .mana_cost("{0}")
+            .types(CardTypeMask::CREATURE)
+            .pt(2, 2)
+            .add_face("Synth Ward", |f| {
+                f.mana_cost("{0}")
+                    .types(CardTypeMask::INSTANT)
+                    .spell_effect(
+                        vec![],
+                        vec![effect_step(
+                            EffectOp::GainLife {
+                                set_life_total: false,
+                            },
+                            Selector::PlayerRef {
+                                player: PlayerRef::You,
+                            },
+                            Some(Amount::Const { n: 2 }),
+                        )],
+                    );
+            });
+    });
+
+    // 2) Adventure: Face 0 = Creature, Face 1 = Instant Adventure
+    let adv = b.add_card("synth_adv_601m", "Synth Squire // Synth Parry", |c| {
+        c.layout(CardLayout::Adventure)
+            .mana_cost("{0}")
+            .types(CardTypeMask::CREATURE)
+            .pt(2, 2)
+            .add_face("Synth Parry", |f| {
+                f.mana_cost("{0}")
+                    .types(CardTypeMask::INSTANT)
+                    .subtype("Adventure")
+                    .spell_effect(
+                        vec![],
+                        vec![effect_step(
+                            EffectOp::GainLife {
+                                set_life_total: false,
+                            },
+                            Selector::PlayerRef {
+                                player: PlayerRef::You,
+                            },
+                            Some(Amount::Const { n: 3 }),
+                        )],
+                    );
+            });
+    });
+
+    // 3) Split (non-fuse): Face 0 = Sorcery, Face 1 = Instant
+    let split = b.add_card("synth_split_601m", "Synth Hammer // Synth Spark", |c| {
+        c.layout(CardLayout::Split)
+            .mana_cost("{0}")
+            .types(CardTypeMask::SORCERY)
+            .spell_effect(
+                vec![],
+                vec![effect_step(
+                    EffectOp::GainLife {
+                        set_life_total: false,
+                    },
+                    Selector::PlayerRef {
+                        player: PlayerRef::You,
+                    },
+                    Some(Amount::Const { n: 4 }),
+                )],
+            )
+            .add_face("Synth Spark", |f| {
+                f.mana_cost("{0}")
+                    .types(CardTypeMask::INSTANT)
+                    .spell_effect(
+                        vec![],
+                        vec![effect_step(
+                            EffectOp::GainLife {
+                                set_life_total: false,
+                            },
+                            Selector::PlayerRef {
+                                player: PlayerRef::You,
+                            },
+                            Some(Amount::Const { n: 1 }),
+                        )],
+                    );
+            });
+    });
+
+    // 4) Split with Fuse: Face 0 = Sorcery, Face 1 = Instant
+    let fuse_split = b.add_card("synth_fuse_601m", "Synth Ritual // Synth Snap", |c| {
+        c.layout(CardLayout::Split)
+            .mana_cost("{0}")
+            .types(CardTypeMask::SORCERY)
+            .keyword("fuse")
+            .spell_effect(
+                vec![],
+                vec![effect_step(
+                    EffectOp::GainLife {
+                        set_life_total: false,
+                    },
+                    Selector::PlayerRef {
+                        player: PlayerRef::You,
+                    },
+                    Some(Amount::Const { n: 1 }),
+                )],
+            )
+            .add_face("Synth Snap", |f| {
+                f.mana_cost("{0}")
+                    .types(CardTypeMask::INSTANT)
+                    .spell_effect(
+                        vec![],
+                        vec![effect_step(
+                            EffectOp::GainLife {
+                                set_life_total: false,
+                            },
+                            Selector::PlayerRef {
+                                player: PlayerRef::You,
+                            },
+                            Some(Amount::Const { n: 1 }),
+                        )],
+                    );
+            });
+    });
+
+    let db = b.build_db();
+    let (cfg, decks) = common::guaranteed_decks(
+        &[&[mdfc, adv, split, split, fuse_split], &[plains]],
+        &[],
+        3,
+        GameConfig::standard_1v1(),
+    );
+    let mut drv = SessionDriver::new(db, cfg, decks, 6017).unwrap();
+    drv.keep_all_hands();
+
+    // Advance to Turn 2 Main1 (Player 1's turn), then pass priority so Player 0 has priority at Instant speed.
+    drv.advance_to(2, GamePhase::Main1, 16);
+    assert_eq!(drv.session.state().active_player(), PlayerId(1));
+    assert_eq!(drv.session.current_actor(), Some(PlayerId(1)));
+    drv.pass_priority();
+    assert_eq!(drv.session.current_actor(), Some(PlayerId(0)));
+
+    // 1) ModalDfc: only face 1 (Instant) is legal at Instant speed; face 0 (Creature) is not.
+    let mdfc_h = drv.find_hand_object(PlayerId(0), mdfc).unwrap();
+    let mdfc_opts = enumerate_cast_options(drv.session.state(), PlayerId(0), mdfc_h);
+    let mdfc_cre_opt = mdfc_opts
+        .iter()
+        .find(|o| o.face_idx == 0)
+        .expect("Creature front face option exists")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(drv.session.state(), PlayerId(0), mdfc_h, mdfc_cre_opt)
+            .is_none(),
+        "MDFC Creature front face must NOT be legal at Instant speed"
+    );
+    let mdfc_inst_opt = mdfc_opts
+        .iter()
+        .find(|o| o.face_idx == 1 && o.alt_kind == AltCastKind::ModalBackFace)
+        .expect("MDFC Instant back face option exists")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(drv.session.state(), PlayerId(0), mdfc_h, mdfc_inst_opt)
+            .is_some(),
+        "MDFC Instant back face must be legal at Instant speed"
+    );
+    drv.macro_step(
+        PlayerId(0),
+        MacroAction::CastSpell {
+            object: mdfc_h,
+            option_id: mdfc_inst_opt,
+            from_zone: Zone::Hand,
+            modes: vec![],
+            x_value: None,
+            targets: vec![],
+        },
+    )
+    .unwrap();
+    drv.resolve_all_stack(8);
+    assert_eq!(drv.session.state().player(PlayerId(0)).unwrap().life, 22);
+
+    // Pass priority back to Player 0 after stack resolution (still Turn 2 Main1).
+    assert_eq!(drv.session.current_actor(), Some(PlayerId(1)));
+    drv.pass_priority();
+    assert_eq!(drv.session.current_actor(), Some(PlayerId(0)));
+
+    // 2) Adventure: only face 1 (Instant Adventure) is legal at Instant speed; face 0 (Creature) is not.
+    let adv_h = drv.find_hand_object(PlayerId(0), adv).unwrap();
+    let adv_opts = enumerate_cast_options(drv.session.state(), PlayerId(0), adv_h);
+    let adv_cre_opt = adv_opts
+        .iter()
+        .find(|o| o.face_idx == 0)
+        .expect("Adventure Creature face option exists")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(drv.session.state(), PlayerId(0), adv_h, adv_cre_opt)
+            .is_none(),
+        "Adventure Creature face must NOT be legal at Instant speed"
+    );
+    let adv_inst_opt = adv_opts
+        .iter()
+        .find(|o| o.face_idx == 1 && o.alt_kind == AltCastKind::AdventureHalf)
+        .expect("Adventure Instant half option exists")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(drv.session.state(), PlayerId(0), adv_h, adv_inst_opt)
+            .is_some(),
+        "Adventure Instant half must be legal at Instant speed"
+    );
+    drv.macro_step(
+        PlayerId(0),
+        MacroAction::CastSpell {
+            object: adv_h,
+            option_id: adv_inst_opt,
+            from_zone: Zone::Hand,
+            modes: vec![],
+            x_value: None,
+            targets: vec![],
+        },
+    )
+    .unwrap();
+    drv.resolve_all_stack(8);
+    assert_eq!(drv.session.state().player(PlayerId(0)).unwrap().life, 25);
+    assert!(drv.find_exile_object(PlayerId(0), adv).is_some());
+
+    // Pass priority back to Player 0 on Turn 2 Main1.
+    drv.pass_priority();
+    assert_eq!(drv.session.current_actor(), Some(PlayerId(0)));
+
+    // 3) Split (Sorcery // Instant): non-fused Sorcery half (face 0) MUST be rejected at Instant speed!
+    let split_h = drv.find_hand_object(PlayerId(0), split).unwrap();
+    let split_opts = enumerate_cast_options(drv.session.state(), PlayerId(0), split_h);
+    let split_sorc_opt = split_opts
+        .iter()
+        .find(|o| o.face_idx == 0 && !o.fused)
+        .expect("Sorcery half option exists")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(
+            drv.session.state(),
+            PlayerId(0),
+            split_h,
+            split_sorc_opt,
+        )
+        .is_none(),
+        "Sorcery half of Sorcery // Instant split must NOT be castable at Instant speed"
+    );
+    let sorc_err = drv
+        .macro_step(
+            PlayerId(0),
+            MacroAction::CastSpell {
+                object: split_h,
+                option_id: split_sorc_opt,
+                from_zone: Zone::Hand,
+                modes: vec![],
+                x_value: None,
+                targets: vec![],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(sorc_err, EngineError::IllegalAction(_)));
+
+    let split_inst_opt = split_opts
+        .iter()
+        .find(|o| o.face_idx == 1 && o.alt_kind == AltCastKind::SplitSecondHalf)
+        .expect("Instant half option exists")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(
+            drv.session.state(),
+            PlayerId(0),
+            split_h,
+            split_inst_opt,
+        )
+        .is_some(),
+        "Instant half of Sorcery // Instant split must be legal at Instant speed"
+    );
+    drv.macro_step(
+        PlayerId(0),
+        MacroAction::CastSpell {
+            object: split_h,
+            option_id: split_inst_opt,
+            from_zone: Zone::Hand,
+            modes: vec![],
+            x_value: None,
+            targets: vec![],
+        },
+    )
+    .unwrap();
+    drv.resolve_all_stack(8);
+    assert_eq!(drv.session.state().player(PlayerId(0)).unwrap().life, 26);
+
+    // 4) Split with Fuse: non-fused Sorcery half is rejected on opponent's turn, while fused keeps combined types.
+    let fuse_h = drv.find_hand_object(PlayerId(0), fuse_split).unwrap();
+    let fuse_opts = enumerate_cast_options(drv.session.state(), PlayerId(0), fuse_h);
+    let fuse_sorc_opt = fuse_opts
+        .iter()
+        .find(|o| o.face_idx == 0 && !o.fused)
+        .unwrap()
+        .option_id;
+    let fuse_both_opt = fuse_opts.iter().find(|o| o.fused).unwrap().option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(drv.session.state(), PlayerId(0), fuse_h, fuse_sorc_opt)
+            .is_none()
+    );
+    assert!(
+        mtg_engine::can_cast_spell_option(drv.session.state(), PlayerId(0), fuse_h, fuse_both_opt)
+            .is_some()
+    );
+
+    // 5) Advance to Turn 3 Main1 (Player 0's own Main phase): Sorcery half of remaining Split is now legal!
+    drv.advance_to(3, GamePhase::Main1, 16);
+    let split_h2 = drv.find_hand_object(PlayerId(0), split).unwrap();
+    let split_sorc_opt2 = enumerate_cast_options(drv.session.state(), PlayerId(0), split_h2)
+        .into_iter()
+        .find(|o| o.face_idx == 0 && !o.fused)
+        .expect("Sorcery half of Split must exist")
+        .option_id;
+    assert!(
+        mtg_engine::can_cast_spell_option(
+            drv.session.state(),
+            PlayerId(0),
+            split_h2,
+            split_sorc_opt2,
+        )
+        .is_some()
+    );
+    drv.macro_step(
+        PlayerId(0),
+        MacroAction::CastSpell {
+            object: split_h2,
+            option_id: split_sorc_opt2,
+            from_zone: Zone::Hand,
+            modes: vec![],
+            x_value: None,
+            targets: vec![],
+        },
+    )
+    .unwrap();
+    drv.resolve_all_stack(8);
+    assert_eq!(drv.session.state().player(PlayerId(0)).unwrap().life, 30);
+}

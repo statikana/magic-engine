@@ -101,6 +101,7 @@ pub fn move_object_raw(
         && !old_flags.contains(ObjectFlags::IS_TOKEN)
     {
         let eff_types = lki_eval
+            .filter(|_| from_zone == Zone::Stack && !opts.entered_transformed)
             .map(|e| e.types)
             .unwrap_or_else(|| base_types_for_object(state, id, opts.entered_transformed));
         if eff_types.intersects(CardTypeMask::INSTANT | CardTypeMask::SORCERY)
@@ -1900,8 +1901,8 @@ fn base_types_for_object(
     let Some(mut opts) = crate::faces::face_opts_for_object(state, id) else {
         return CardTypeMask::empty();
     };
+    opts.zone = Zone::Battlefield;
     if entered_transformed {
-        opts.zone = Zone::Battlefield;
         opts.face_index = 1;
     }
     crate::faces::resolve_object_faces(state.db(), obj.card_def, &opts)
