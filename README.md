@@ -30,6 +30,22 @@ Start at **[`docs/README.md`](docs/README.md)** for the complete high-to-low-lev
 | `crates/mtg-wasm` | Stateful `wasm-bindgen` wrapper over `mtg-engine` (no compiler embedded) for browser/npm consumers. |
 | `crates/mtg-py` | `PyO3` Python bindings + batched `VecEnv` observations for ML/RL training. |
 
+## Quick Start
+
+```bash
+# Run workspace unit, integration, and compiler tests
+cargo test --workspace
+
+# Run release performance benchmarks (clone, stepping, layer cache, snapshots)
+cargo bench -p mtg-engine --bench engine_perf
+
+# Compile a local Scryfall bulk JSONL(.gz) file directly into cards.bin (pure Rust)
+cargo run --release -p mtg-cli -- build-db /path/to/oracle-cards.jsonl.gz --out cards.bin
+
+# Inspect database decode latency, coverage, and bundled decks
+cargo run --release -p mtg-cli -- inspect-db cards.bin
+```
+
 ## Legal / Card Data Separation
 
 This repository contains **no Wizards of the Coast or Scryfall card data, artwork, or flavor text**. Card databases (`cards.bin`) are built locally from user-supplied Scryfall bulk data via `mtg-cli build-db`.
