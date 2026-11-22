@@ -739,6 +739,68 @@ fn annihilate_plus_minus_counters(state: &mut GameState) -> bool {
     true
 }
 
+fn object_allows_equip_planeswalker(
+    state: &GameState,
+    id: ObjectId,
+    cache: &crate::state::LayerCache,
+) -> bool {
+    let Some(obj) = state.object(id) else {
+        return false;
+    };
+    let db = state.db();
+    let is_equip_kw = |kw: mtg_ir::KeywordId| {
+        db.keyword_name(kw)
+            .is_some_and(|n| n.eq_ignore_ascii_case("equip"))
+    };
+    let extras = cache.extra(id);
+    if !extras.is_some_and(|ex| ex.innate_abilities_removed) {
+        let ctx = EvalContext::for_source(obj.controller, id).with_board(BoardView::Cached(cache));
+        for ab in crate::faces::active_abilities_for_object(state, id, &ctx) {
+            if let mtg_ir::AbilityDef::Keyword(k) = ab.ability
+                && k.keyword.equip_allow_planeswalker
+                && is_equip_kw(k.keyword.keyword)
+                && !extras.is_some_and(|ex| ex.cant_have_keywords.contains(&k.keyword.keyword))
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(ex) = extras {
+        for g in &ex.granted_abilities {
+            match g {
+                crate::layers::predicates::GrantedAbilityEntry::Inline { ability, .. } => {
+                    if let mtg_ir::AbilityDef::Keyword(k) = ability.as_ref()
+                        && k.keyword.equip_allow_planeswalker
+                        && is_equip_kw(k.keyword.keyword)
+                        && !ex.cant_have_keywords.contains(&k.keyword.keyword)
+                    {
+                        return true;
+                    }
+                }
+                crate::layers::predicates::GrantedAbilityEntry::CardAbility {
+                    card_def,
+                    face_index,
+                    ability_index,
+                    ..
+                } => {
+                    if let Some(mtg_ir::AbilityDef::Keyword(k)) = db
+                        .get(*card_def)
+                        .and_then(|c| c.faces.get(usize::from(*face_index)))
+                        .and_then(|f| f.abilities.get(*ability_index))
+                        && k.keyword.equip_allow_planeswalker
+                        && is_equip_kw(k.keyword.keyword)
+                        && !ex.cant_have_keywords.contains(&k.keyword.keyword)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 fn check_attachment_sbas(state: &mut GameState, graveyard_batch: &mut Vec<ObjectId>) -> bool {
     let aura_sid = state.db().subtype_id("Aura");
     let equip_sid = state.db().subtype_id("Equipment");
@@ -800,12 +862,14 @@ fn check_attachment_sbas(state: &mut GameState, graveyard_batch: &mut Vec<Object
                 } else if (is_equip || is_fort)
                     && let Some(host) = obj.attached_to
                 {
+                    let allows_pw = is_equip && object_allows_equip_planeswalker(state, id, cache);
                     let host_ok = state
                         .object(host)
                         .is_some_and(|ho| ho.zone == Zone::Battlefield && !ho.is_phased_out())
                         && cache.get(host).is_some_and(|he| {
                             if is_equip {
                                 he.types.contains(CardTypeMask::CREATURE)
+                                    || (allows_pw && he.types.contains(CardTypeMask::PLANESWALKER))
                             } else {
                                 he.types.contains(CardTypeMask::LAND)
                             }

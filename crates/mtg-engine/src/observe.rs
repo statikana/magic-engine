@@ -385,8 +385,13 @@ pub(crate) fn is_in_active_viewer_prompt(
                 chooser,
                 candidates,
                 selected,
+                moved_ids,
                 ..
-            } if *chooser == viewer && (candidates.contains(&id) || selected.contains(&id)) => {
+            } if *chooser == viewer
+                && (candidates.contains(&id)
+                    || selected.contains(&id)
+                    || moved_ids.contains(&id)) =>
+            {
                 return true;
             }
             StepPauseState::ReorderLibrary {
@@ -409,13 +414,73 @@ pub(crate) fn is_in_active_viewer_prompt(
                 revealed,
                 candidates,
                 selected,
+                partition_picks,
                 ..
             } if *player == viewer
                 && (revealed.contains(&id)
                     || candidates.contains(&id)
-                    || selected.contains(&id)) =>
+                    || selected.contains(&id)
+                    || partition_picks.contains(&id)) =>
             {
                 return true;
+            }
+            StepPauseState::MoveCountersSelectTarget {
+                chooser,
+                from_id,
+                candidates,
+                transfers,
+                ..
+            } if *chooser == viewer
+                && (*from_id == id
+                    || candidates.contains(&id)
+                    || transfers.iter().any(|&(tid, _)| tid == id)) =>
+            {
+                return true;
+            }
+            StepPauseState::MoveCountersChooseAmount {
+                chooser,
+                from_id,
+                candidates,
+                target_id,
+                transfers,
+                ..
+            } if *chooser == viewer
+                && (*from_id == id
+                    || *target_id == id
+                    || candidates.contains(&id)
+                    || transfers.iter().any(|&(tid, _)| tid == id)) =>
+            {
+                return true;
+            }
+            StepPauseState::WaitingOnReplacement {
+                batch_remaining,
+                batch_idx,
+                op_tag,
+            } if *op_tag == crate::effects::vm::OP_TAG_SEARCH => {
+                if let Some(cont) = vm.pending_continuation.as_deref()
+                    && cont.search_chooser == Some(viewer)
+                    && (batch_remaining
+                        .get(*batch_idx..)
+                        .is_some_and(|rem| rem.contains(&id))
+                        || cont.search_candidates.contains(&id)
+                        || cont.search_moved_ids.contains(&id))
+                {
+                    return true;
+                }
+            }
+            StepPauseState::WaitingOnReplacement {
+                batch_remaining,
+                batch_idx,
+                op_tag,
+            } if *op_tag == crate::effects::vm::OP_TAG_DIG => {
+                if let Some(cont) = vm.pending_continuation.as_deref()
+                    && cont.dig_player == Some(viewer)
+                    && batch_remaining
+                        .get(*batch_idx..)
+                        .is_some_and(|rem| rem.contains(&id))
+                {
+                    return true;
+                }
             }
             _ => {}
         }
@@ -1449,5 +1514,141 @@ mod tests {
             Some(PlayerId(0))
         ));
         assert!(!is_top_of_library_visible_to(&state, PlayerId(0), None));
+    }
+
+    #[test]
+    fn synth_observe_dig_and_search_during_waiting_on_replacement() {
+        let db = make_synth_db();
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 15],
+            sideboard: vec![],
+        };
+        let mut cfg = GameConfig::standard_1v1();
+        cfg.starting_hand_size = 0;
+        let mut state = GameState::new(db, cfg, &[deck.clone(), deck], 79).unwrap();
+
+        let lib = state.players()[0].library.clone();
+        let d0 = lib[lib.len() - 1];
+        let d1 = lib[lib.len() - 2];
+        let d2 = lib[lib.len() - 3];
+        let s_cand = lib[lib.len() - 4];
+        let s_moved_raw = lib[lib.len() - 5];
+        let s_moved = exile_face_down(
+            &mut state,
+            s_moved_raw,
+            FaceDownSpec {
+                kind: FaceDownKind::ExiledFaceDown,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .new_id
+        .unwrap();
+
+        // Setup ResolutionFrame + VM paused on OP_TAG_DIG for PlayerId(0):
+        state
+            .resolution_frames_mut()
+            .push(crate::state::ResolutionFrame {
+                stack_item: crate::id::StackItemId(801),
+                steps_remaining: vec![],
+                pc: 0,
+                bindings: vec![],
+                pending_prompt_id: Some(1),
+            });
+        state
+            .resolution_vms_mut()
+            .push(crate::state::ResolutionVmState {
+                stack_item: crate::id::StackItemId(801),
+                controller: PlayerId(0),
+                source: None,
+                source_lki: None,
+                x_value: 0,
+                targets: vec![],
+                targets_by_spec: vec![],
+                divisions: SmallVec::new(),
+                step_results: vec![],
+                pause_state: Some(StepPauseState::WaitingOnReplacement {
+                    batch_remaining: vec![d0, d1, d2],
+                    batch_idx: 1,
+                    op_tag: crate::effects::vm::OP_TAG_DIG,
+                }),
+                pending_continuation: Some(Box::new(crate::state::PendingStepContinuation {
+                    dig_player: Some(PlayerId(0)),
+                    dig_roles: smallvec::smallvec![
+                        crate::state::DigMoveRole::PartitionHand,
+                        crate::state::DigMoveRole::PartitionSecond,
+                        crate::state::DigMoveRole::PartitionBottom,
+                    ],
+                    ..Default::default()
+                })),
+                subframes: vec![],
+                step_acted_ids: vec![],
+                already_selected_controllers: SmallVec::new(),
+                each_loop_player: None,
+                chosen_opponent: None,
+                event_object: None,
+                event_lki: None,
+                event_player: None,
+                event_amount: None,
+                defending_player: None,
+                last_effect_amount: 0,
+                last_excess_damage: 0,
+                last_counters_removed: 0,
+                last_roll_result: 0,
+                coin_heads_count: 0,
+                counters_removed_this_way: 0,
+                step_way_stats: Default::default(),
+            });
+
+        // batch_remaining[batch_idx..] = [d1, d2] visible to dig_player P0, NOT to P1; d0 (before batch_idx) not exposed via batch_remaining.
+        assert!(is_object_visible_to(&state, d1, Some(PlayerId(0))));
+        assert!(is_object_visible_to(&state, d2, Some(PlayerId(0))));
+        assert!(!is_object_visible_to(&state, d0, Some(PlayerId(0))));
+        assert!(!is_object_visible_to(&state, d1, Some(PlayerId(1))));
+        assert!(!is_object_visible_to(&state, d2, Some(PlayerId(1))));
+        let obs_p1_dig = observe_state(&state, PlayerId(1), vec![]);
+        assert!(!obs_p1_dig.entities.iter().any(|e| e.zone == Zone::Library));
+
+        // Switch pause to OP_TAG_SEARCH for PlayerId(0):
+        {
+            let vm = state.resolution_vms_mut().last_mut().unwrap();
+            vm.pause_state = Some(StepPauseState::WaitingOnReplacement {
+                batch_remaining: vec![d0, d1],
+                batch_idx: 0,
+                op_tag: crate::effects::vm::OP_TAG_SEARCH,
+            });
+            vm.pending_continuation = Some(Box::new(crate::state::PendingStepContinuation {
+                search_chooser: Some(PlayerId(0)),
+                search_candidates: vec![s_cand],
+                search_moved_ids: vec![s_moved],
+                ..Default::default()
+            }));
+        }
+
+        assert!(is_object_visible_to(&state, d0, Some(PlayerId(0))));
+        assert!(is_object_visible_to(&state, d1, Some(PlayerId(0))));
+        assert!(is_object_visible_to(&state, s_cand, Some(PlayerId(0))));
+        assert!(is_object_visible_to(&state, s_moved, Some(PlayerId(0))));
+
+        // Opponent P1 must see NONE of them (neither library cards nor face-down exile card).
+        assert!(!is_object_visible_to(&state, d0, Some(PlayerId(1))));
+        assert!(!is_object_visible_to(&state, d1, Some(PlayerId(1))));
+        assert!(!is_object_visible_to(&state, s_cand, Some(PlayerId(1))));
+        assert!(!is_object_visible_to(&state, s_moved, Some(PlayerId(1))));
+        let obs_p1_search = observe_state(&state, PlayerId(1), vec![]);
+        assert!(
+            !obs_p1_search
+                .entities
+                .iter()
+                .any(|e| e.zone == Zone::Library)
+        );
+        let ex_ent = obs_p1_search
+            .entities
+            .iter()
+            .find(|e| e.id == s_moved)
+            .expect("exile entity emitted");
+        assert_eq!(ex_ent.card_def, TOKEN_CARD_DEF_ID);
     }
 }

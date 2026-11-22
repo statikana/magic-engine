@@ -7,7 +7,7 @@ use mtg_ir::{
 };
 use smallvec::SmallVec;
 
-use crate::action::{AttackTarget, ChoiceRequest, DecisionState};
+use crate::action::AttackTarget;
 use crate::eval::{BoardView, EvalContext, evaluate_amount, evaluate_condition};
 use crate::events::{AtomicEventKind, emit_event};
 use crate::filter::{find_objects, matches_object_filter};
@@ -16,8 +16,8 @@ use crate::keywords::has_indestructible;
 use crate::replace::{self, ReplacementOutcome, ReplacementResult};
 use crate::state::{
     CopiableState, DirtyMask, EngineError, GameObject, GameState, LkiSnapshot, ObjectFlags,
-    PendingPromptContext, PendingStepContinuation, PromptOwner, RareObjectState, StepPauseState,
-    TOKEN_CARD_DEF_ID, TimedCopiableBackup, UntilSourceLeavesReturn, YesNoPausePurpose,
+    PendingStepContinuation, RareObjectState, TOKEN_CARD_DEF_ID, TimedCopiableBackup,
+    UntilSourceLeavesReturn,
 };
 use crate::zones::{
     self, CreateTokenOptions, MoveObjectOutcome, MoveRawOptions, MoveRawOutcome, ZonePosition,
@@ -27,8 +27,9 @@ use super::vm::{
     OP_TAG_BOUNCE, OP_TAG_CREATE_TOKEN, OP_TAG_DESTROY, OP_TAG_DISCARD, OP_TAG_EXILE, OP_TAG_MILL,
     OP_TAG_MOVE, OP_TAG_SACRIFICE, SelectionResult, StepExecOutcome, append_step_binding,
     handle_zone_move_outcome, move_opts_for_zone, rare_turn_state_mut, record_step_bindings,
-    resolve_selection_mod, resolve_selector_objects, resolve_step_actor, resolve_step_amount,
-    resolve_target_players, set_waiting_on_replacement, vm_controller, vm_source, with_vm_eval,
+    resolve_selection_mod, resolve_selection_mod_ex, resolve_selector_objects, resolve_step_actor,
+    resolve_step_amount, resolve_target_players, set_waiting_on_replacement, vm_controller,
+    vm_source, with_vm_eval,
 };
 
 fn try_regenerate_permanent(state: &mut GameState, id: ObjectId) -> bool {
@@ -263,6 +264,25 @@ pub(crate) fn resume_zone_move_batch(
 ) -> Result<StepExecOutcome, EngineError> {
     let ctrl = vm_controller(state);
     let bind_as = step.bind_as.as_deref();
+    let is_move_shuffle = op_tag == OP_TAG_MOVE
+        && matches!(
+            &step.op,
+            mtg_ir::EffectOp::Move {
+                to: Some(Zone::Library),
+                may_shuffle: true,
+                ..
+            }
+        );
+    let mut shuffle_owners: SmallVec<[PlayerId; 4]> = if start_idx > 0 && is_move_shuffle {
+        state
+            .resolution_vms_mut()
+            .last_mut()
+            .and_then(|vm| vm.pending_continuation.take())
+            .map(|c| c.move_shuffle_owners)
+            .unwrap_or_default()
+    } else {
+        SmallVec::new()
+    };
 
     for (offset, &id) in batch[start_idx..].iter().enumerate() {
         let idx = start_idx + offset;
@@ -270,6 +290,7 @@ pub(crate) fn resume_zone_move_batch(
             continue;
         };
         let obj_zone = obj.zone;
+        let obj_owner = obj.owner;
         if op_tag == OP_TAG_DESTROY {
             if obj_zone != Zone::Battlefield || has_indestructible(state, id) {
                 continue;
@@ -277,6 +298,9 @@ pub(crate) fn resume_zone_move_batch(
             if try_regenerate_permanent(state, id) {
                 continue;
             }
+        }
+        if is_move_shuffle && !shuffle_owners.contains(&obj_owner) {
+            shuffle_owners.push(obj_owner);
         }
         let (dest, opts) = match op_tag {
             OP_TAG_DESTROY => (Zone::Graveyard, MoveRawOptions::default()),
@@ -340,6 +364,15 @@ pub(crate) fn resume_zone_move_batch(
         let res = handle_zone_move_outcome(state, mv, bind_as, batch.to_vec(), idx, op_tag)?;
         match res {
             StepExecOutcome::Paused { prompt_id, chooser } => {
+                if is_move_shuffle
+                    && !shuffle_owners.is_empty()
+                    && let Some(vm) = state.resolution_vms_mut().last_mut()
+                {
+                    let cont = vm
+                        .pending_continuation
+                        .get_or_insert_with(|| Box::new(PendingStepContinuation::default()));
+                    cont.move_shuffle_owners = shuffle_owners;
+                }
                 return Ok(StepExecOutcome::Paused { prompt_id, chooser });
             }
             StepExecOutcome::EnterSubframe => {
@@ -353,41 +386,68 @@ pub(crate) fn resume_zone_move_batch(
         }
     }
 
-    if op_tag == OP_TAG_MOVE
-        && let mtg_ir::EffectOp::Move {
-            may_shuffle: true, ..
-        } = &step.op
-    {
-        let actor = resolve_step_actor(state, step);
-        let prompt_id = state.allocate_prompt_id();
-        if let Some(vm) = state.resolution_vms_mut().last_mut() {
-            vm.pause_state = Some(StepPauseState::OptionalChoice {
-                chooser: actor,
-                purpose: YesNoPausePurpose::MayShuffleAfterMoveOrLook,
-            });
+    if is_move_shuffle {
+        if shuffle_owners.is_empty()
+            && let Selector::All { ref filter } = step.subject
+        {
+            if step.actor.is_some() {
+                let actor = resolve_step_actor(state, step);
+                if !shuffle_owners.contains(&actor) {
+                    shuffle_owners.push(actor);
+                }
+            } else if matches!(
+                filter.owner.or(filter.controller),
+                Some(mtg_ir::RelativeControl::You)
+            ) {
+                if !shuffle_owners.contains(&ctrl) {
+                    shuffle_owners.push(ctrl);
+                }
+            } else if matches!(
+                filter.owner.or(filter.controller),
+                Some(mtg_ir::RelativeControl::Opponent)
+            ) {
+                for pid in crate::triggers::apnap_player_order(state) {
+                    if pid != ctrl && state.player(pid).is_some_and(|p| !p.lost) {
+                        shuffle_owners.push(pid);
+                    }
+                }
+            } else {
+                for pid in crate::triggers::apnap_player_order(state) {
+                    if state.player(pid).is_some_and(|p| !p.lost) {
+                        shuffle_owners.push(pid);
+                    }
+                }
+            }
         }
-        if let Some(fr) = state.resolution_frames_mut().last_mut() {
-            fr.pending_prompt_id = Some(prompt_id);
+        for owner in shuffle_owners {
+            if state.player(owner).is_some_and(|p| !p.lost) {
+                zones::shuffle_library(state, owner, 0)?;
+                emit_event(state, AtomicEventKind::LibraryShuffled { player: owner });
+            }
         }
-        let req = ChoiceRequest::YesNo {
-            prompt_id,
-            label: "Shuffle your library?".into(),
-        };
-        state.set_pending_prompt(Some(PendingPromptContext {
-            prompt_id,
-            chooser: actor,
-            request: req.clone(),
-            owner: PromptOwner::ResolutionFrame,
-        }));
-        state.set_decision(DecisionState::Prompt { request: req });
-        state.set_priority_player(actor);
-        return Ok(StepExecOutcome::Paused {
-            prompt_id,
-            chooser: actor,
-        });
     }
 
     Ok(StepExecOutcome::Done)
+}
+
+pub(crate) fn run_move_targets(
+    state: &mut GameState,
+    step: &EffectStep,
+    mut targets: Vec<ObjectId>,
+) -> Result<StepExecOutcome, EngineError> {
+    if let mtg_ir::EffectOp::Move {
+        to: Some(Zone::Library),
+        position,
+        from_top: None,
+        may_shuffle: false,
+        ..
+    } = &step.op
+        && matches!(position, None | Some(LibraryPosition::Top))
+        && targets.len() > 1
+    {
+        targets.reverse();
+    }
+    resume_zone_move_batch(state, step, &targets, 0, OP_TAG_MOVE)
 }
 
 pub(crate) fn run_destroy_targets(
@@ -534,12 +594,12 @@ pub(crate) fn exec_move(
     state: &mut GameState,
     step: &EffectStep,
     from: Option<Zone>,
-    _to: Option<Zone>,
+    to: Option<Zone>,
     select: &SelectionMod,
     _tapped: bool,
     _under_your_control: bool,
     topmost_only: bool,
-    _may_shuffle: bool,
+    may_shuffle: bool,
     _position: Option<LibraryPosition>,
     from_top: Option<u16>,
     _library_choice_by: Option<LibraryChoiceBy>,
@@ -578,14 +638,27 @@ pub(crate) fn exec_move(
         raw_cands.truncate(1);
     }
     let default_zm = from.map_or(ZoneMask::ALL, ZoneMask::from_zone);
-    let targets = match resolve_selection_mod(state, raw_cands, select, actor, default_zm)? {
+    let mut eff_select = select.clone();
+    if eff_select.choice_count.is_none() && step.amount.is_some() {
+        eff_select.choice_count = step.amount.clone();
+    }
+    let pause_for_library_order =
+        from == Some(Zone::Hand) && to == Some(Zone::Library) && !may_shuffle && from_top.is_none();
+    let targets = match resolve_selection_mod_ex(
+        state,
+        raw_cands,
+        &eff_select,
+        actor,
+        default_zm,
+        pause_for_library_order,
+    )? {
         SelectionResult::Paused { prompt_id, chooser } => {
             return Ok(StepExecOutcome::Paused { prompt_id, chooser });
         }
         SelectionResult::Ready(v) => v,
     };
 
-    resume_zone_move_batch(state, step, &targets, 0, OP_TAG_MOVE)
+    run_move_targets(state, step, targets)
 }
 
 pub(crate) fn exec_sacrifice(

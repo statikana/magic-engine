@@ -487,6 +487,77 @@ pub(crate) fn exec_move_counters(
 ) -> Result<StepExecOutcome, EngineError> {
     let ctrl = resolve_step_actor(state, step);
     let src = vm_source(state);
+
+    // Interactive MoveCounters (e.g. "move any number of +1/+1 counters from ~ onto other creatures"):
+    // triggered when both `spec` and `step.amount` are None.
+    if spec.is_none() && step.amount.is_none() {
+        let from_id = resolve_selector_objects(state, &step.subject)
+            .into_iter()
+            .next();
+        let Some(from_id) = from_id.filter(|&id| {
+            state
+                .object(id)
+                .is_some_and(|o| o.zone == Zone::Battlefield)
+        }) else {
+            return Ok(StepExecOutcome::Done);
+        };
+        let Some(cid) = counter.or_else(|| state.counters(from_id).first().map(|&(c, _)| c)) else {
+            return Ok(StepExecOutcome::Done);
+        };
+        let available = state.counter_count(from_id, cid);
+        if available == 0 {
+            return Ok(StepExecOutcome::Done);
+        }
+        let default_filter = ObjectFilter {
+            types_any: CardTypeMask::CREATURE,
+            ..Default::default()
+        };
+        let tf = to_filter.unwrap_or(&default_filter);
+        let mut candidates: Vec<ObjectId> =
+            with_vm_eval(state, |ctx, _| find_objects(state, tf, ctx));
+        candidates.retain(|&id| {
+            id != from_id
+                && state
+                    .object(id)
+                    .is_some_and(|o| o.zone == Zone::Battlefield && !o.is_phased_out())
+        });
+        if candidates.is_empty() {
+            return Ok(StepExecOutcome::Done);
+        }
+        let prompt_id = state.allocate_prompt_id();
+        if let Some(vm) = state.resolution_vms_mut().last_mut() {
+            vm.pause_state = Some(StepPauseState::MoveCountersSelectTarget {
+                chooser: ctrl,
+                from_id,
+                counter: cid,
+                candidates: candidates.clone(),
+                remaining: available,
+                transfers: Vec::new(),
+            });
+        }
+        if let Some(fr) = state.resolution_frames_mut().last_mut() {
+            fr.pending_prompt_id = Some(prompt_id);
+        }
+        let req = ChoiceRequest::ChooseObjects {
+            prompt_id,
+            candidates,
+            min: 0,
+            max: 1,
+        };
+        state.set_pending_prompt(Some(PendingPromptContext {
+            prompt_id,
+            chooser: ctrl,
+            request: req.clone(),
+            owner: PromptOwner::ResolutionFrame,
+        }));
+        state.set_decision(DecisionState::Prompt { request: req });
+        state.set_priority_player(ctrl);
+        return Ok(StepExecOutcome::Paused {
+            prompt_id,
+            chooser: ctrl,
+        });
+    }
+
     let amt = resolve_step_amount(state, step, 1).max(0) as u32;
 
     let (from_objs, to_objs, cid_target, move_all) = if let Some(sp) = spec {
@@ -531,6 +602,56 @@ pub(crate) fn exec_move_counters(
         }
         let prev_from = state.counter_count(from_id, cid);
         let removed = state.remove_counter(from_id, cid, n);
+        if removed > 0 {
+            emit_event(
+                state,
+                AtomicEventKind::CounterChanged {
+                    object: from_id,
+                    counter: cid,
+                    previous_count: prev_from,
+                    new_count: prev_from.saturating_sub(removed),
+                    actor: Some(ctrl),
+                },
+            );
+            if let ReplacementResult::Resolved(out) =
+                replace::resolve_put_counters(state, to_id, cid, removed, Some(ctrl), src)?
+            {
+                apply_resolved_put_counters(state, &out, ctrl);
+            }
+        }
+    }
+    Ok(StepExecOutcome::Done)
+}
+
+pub(crate) fn finalize_interactive_move_counters(
+    state: &mut GameState,
+    ctrl: PlayerId,
+    from_id: ObjectId,
+    cid: CounterId,
+    transfers: Vec<(ObjectId, u32)>,
+) -> Result<StepExecOutcome, EngineError> {
+    if !state
+        .object(from_id)
+        .is_some_and(|o| o.zone == Zone::Battlefield)
+    {
+        return Ok(StepExecOutcome::Done);
+    }
+    let src = vm_source(state);
+    for (to_id, req_n) in transfers {
+        if req_n == 0
+            || to_id == from_id
+            || !state
+                .object(to_id)
+                .is_some_and(|o| o.zone == Zone::Battlefield && !o.is_phased_out())
+        {
+            continue;
+        }
+        let actual = req_n.min(state.counter_count(from_id, cid));
+        if actual == 0 {
+            continue;
+        }
+        let prev_from = state.counter_count(from_id, cid);
+        let removed = state.remove_counter(from_id, cid, actual);
         if removed > 0 {
             emit_event(
                 state,
@@ -2050,6 +2171,69 @@ pub(crate) fn exec_gain_control(
     Ok(StepExecOutcome::Done)
 }
 
+fn object_allows_equip_planeswalker(
+    state: &GameState,
+    id: ObjectId,
+    cache: &crate::state::LayerCache,
+) -> bool {
+    let Some(obj) = state.object(id) else {
+        return false;
+    };
+    let db = state.db();
+    let is_equip_kw = |kw: mtg_ir::KeywordId| {
+        db.keyword_name(kw)
+            .is_some_and(|n| n.eq_ignore_ascii_case("equip"))
+    };
+    let extras = cache.extra(id);
+    if !extras.is_some_and(|ex| ex.innate_abilities_removed) {
+        let ctx = crate::eval::EvalContext::for_source(obj.controller, id)
+            .with_board(crate::eval::BoardView::Cached(cache));
+        for ab in faces::active_abilities_for_object(state, id, &ctx) {
+            if let AbilityDef::Keyword(k) = ab.ability
+                && k.keyword.equip_allow_planeswalker
+                && is_equip_kw(k.keyword.keyword)
+                && !extras.is_some_and(|ex| ex.cant_have_keywords.contains(&k.keyword.keyword))
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(ex) = extras {
+        for g in &ex.granted_abilities {
+            match g {
+                crate::layers::predicates::GrantedAbilityEntry::Inline { ability, .. } => {
+                    if let AbilityDef::Keyword(k) = ability.as_ref()
+                        && k.keyword.equip_allow_planeswalker
+                        && is_equip_kw(k.keyword.keyword)
+                        && !ex.cant_have_keywords.contains(&k.keyword.keyword)
+                    {
+                        return true;
+                    }
+                }
+                crate::layers::predicates::GrantedAbilityEntry::CardAbility {
+                    card_def,
+                    face_index,
+                    ability_index,
+                    ..
+                } => {
+                    if let Some(AbilityDef::Keyword(k)) = db
+                        .get(*card_def)
+                        .and_then(|c| c.faces.get(usize::from(*face_index)))
+                        .and_then(|f| f.abilities.get(*ability_index))
+                        && k.keyword.equip_allow_planeswalker
+                        && is_equip_kw(k.keyword.keyword)
+                        && !ex.cant_have_keywords.contains(&k.keyword.keyword)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn run_attach_targets(
     state: &mut GameState,
     step: &EffectStep,
@@ -2059,27 +2243,103 @@ pub(crate) fn run_attach_targets(
     let Some(host) = hosts.first().copied() else {
         return Ok(StepExecOutcome::Done);
     };
+    let aura_sid = state.db().subtype_id("Aura");
+    let equip_sid = state.db().subtype_id("Equipment");
+    let fort_sid = state.db().subtype_id("Fortification");
     let mut acted = Vec::new();
     for att in to_attach {
-        if state
-            .object(att)
-            .is_some_and(|o| o.zone == Zone::Battlefield)
-            && state
-                .object(host)
-                .is_some_and(|o| o.zone == Zone::Battlefield)
-            && att != host
+        let Some(att_obj) = state.object(att) else {
+            continue;
+        };
+        let Some(host_obj) = state.object(host) else {
+            continue;
+        };
+        if att_obj.zone != Zone::Battlefield
+            || host_obj.zone != Zone::Battlefield
+            || att_obj.is_phased_out()
+            || host_obj.is_phased_out()
+            || att == host
         {
-            zones::attach_raw(state, att, host)?;
+            continue;
+        }
+        // CR 701.3b / CR 613.7e: Attaching an Equipment/Aura/Fortification to the permanent it is
+        // already attached to is a no-op (no timestamp bump, no AttachmentChanged events).
+        if att_obj.attached_to == Some(host) {
+            acted.push((att, None));
+            continue;
+        }
+        let prev_host = att_obj.attached_to;
+        {
+            let cache = state.evaluate_board();
+            let Some(eval) = cache.get(att) else {
+                continue;
+            };
+            let Some(host_eval) = cache.get(host) else {
+                continue;
+            };
+            let is_equip = eval.types.contains(CardTypeMask::ARTIFACT)
+                && equip_sid.is_some_and(|sid| eval.subtypes.contains(&sid));
+            let is_aura = eval.types.contains(CardTypeMask::ENCHANTMENT)
+                && aura_sid.is_some_and(|sid| eval.subtypes.contains(&sid));
+            let is_fort = eval.types.contains(CardTypeMask::ARTIFACT)
+                && fort_sid.is_some_and(|sid| eval.subtypes.contains(&sid));
+            if !is_equip && !is_aura && !is_fort {
+                continue;
+            }
+            if is_equip {
+                // CR 301.5c: An Equipment that is also a creature cannot attach unless it has reconfigure.
+                if eval.types.contains(CardTypeMask::CREATURE)
+                    && !crate::keywords::has_keyword(state, att, "reconfigure")
+                {
+                    continue;
+                }
+                let allows_pw = object_allows_equip_planeswalker(state, att, cache);
+                if !(host_eval.types.contains(CardTypeMask::CREATURE)
+                    || (allows_pw && host_eval.types.contains(CardTypeMask::PLANESWALKER)))
+                {
+                    continue;
+                }
+            }
+            if is_fort && !host_eval.types.contains(CardTypeMask::LAND) {
+                continue;
+            }
+            if is_aura
+                && (eval.types.contains(CardTypeMask::CREATURE)
+                    || !crate::keywords::enchant_legality_for_aura(
+                        state,
+                        att,
+                        crate::action::TargetRef::Object { id: host },
+                    ))
+            {
+                continue;
+            }
+            // CR 702.16n: Protection from the attachment prevents attachment.
+            if crate::keywords::has_protection_from(state, host, att, true) {
+                continue;
+            }
+        }
+        zones::attach_raw(state, att, host)?;
+        if let Some(prev) = prev_host
+            && prev != host
+        {
             emit_event(
                 state,
                 AtomicEventKind::AttachmentChanged {
                     attachment: att,
-                    host,
-                    attached: true,
+                    host: prev,
+                    attached: false,
                 },
             );
-            acted.push((att, None));
         }
+        emit_event(
+            state,
+            AtomicEventKind::AttachmentChanged {
+                attachment: att,
+                host,
+                attached: true,
+            },
+        );
+        acted.push((att, None));
     }
     record_step_bindings(state, step.bind_as.as_deref(), &acted);
     Ok(StepExecOutcome::Done)

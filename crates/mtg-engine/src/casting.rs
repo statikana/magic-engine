@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use mtg_ir::{
@@ -86,7 +87,7 @@ fn find_modal_def_cached<'a>(
     state: &'a GameState,
     cs: &CastingState,
     cache: &'a LayerCache,
-) -> Option<&'a ModalDef> {
+) -> Option<Cow<'a, ModalDef>> {
     match cs.kind {
         CastKind::Spell => {
             let obj = state.object(cs.object)?;
@@ -96,16 +97,21 @@ fn find_modal_def_cached<'a>(
                 .map_or(obj.card_def, |c| c.card_def);
             find_spell_ability(state, eff_def, cs.face_idx, cs.cleaved, cs.gift_promised)
                 .and_then(|sa| sa.modal.as_ref())
+                .map(Cow::Borrowed)
         }
         CastKind::ActivatedAbility { ability_index, .. } => {
             resolve_activated_abilities_cached(state, cs.object, cache)
                 .into_iter()
                 .find(|r| r.ability_index == ability_index)
-                .and_then(|r| r.ability.modal.as_ref())
+                .and_then(|r| match r.ability {
+                    Cow::Borrowed(a) => a.modal.as_ref().map(Cow::Borrowed),
+                    Cow::Owned(a) => a.modal.map(Cow::Owned),
+                })
         }
         CastKind::TriggeredAbility { stack_item } => state
             .stack_trigger_meta(stack_item)
-            .and_then(|m| m.modal.as_ref()),
+            .and_then(|m| m.modal.as_ref())
+            .map(Cow::Borrowed),
     }
 }
 
@@ -156,7 +162,7 @@ fn active_target_specs_with_modal_cached(
 ) -> (Vec<TargetSpec>, Option<SmallVec<[u16; 8]>>) {
     let base = base_target_specs_cached(state, cs, cache);
     if let Some(modal) = find_modal_def_cached(state, cs, cache) {
-        build_modal_target_specs(&base, modal, &cs.chosen_modes)
+        build_modal_target_specs(&base, modal.as_ref(), &cs.chosen_modes)
     } else {
         (base, None)
     }
@@ -231,7 +237,7 @@ fn build_casting_spend_ctx_cached(
             let resolved = resolve_activated_abilities_cached(state, cs.object, cache)
                 .into_iter()
                 .find(|r| r.ability_index == ability_index);
-            let act = resolved.as_ref().map(|r| r.ability);
+            let act = resolved.as_ref().map(|r| r.ability.as_ref());
             ManaSpendContext {
                 player: cs.caster,
                 kind: ManaSpendContextKind::ActivatedAbility,
@@ -249,7 +255,7 @@ fn build_casting_spend_ctx_cached(
                 is_bestowed: false,
                 is_face_down: false,
                 alt_cast_spend_any_color: false,
-                mana_as_any_color_ability: resolved.is_some_and(|r| r.mana_as_any_color),
+                mana_as_any_color_ability: resolved.as_ref().is_some_and(|r| r.mana_as_any_color),
                 x_spend_colors: act.map_or(ColorMask::empty(), |a| a.x_spend_colors),
                 x_colored_only: act.is_some_and(|a| a.x_colored_only),
                 x_max_one_per_color: act.is_some_and(|a| a.x_max_one_per_color),
@@ -1018,12 +1024,12 @@ pub(crate) fn legal_casting_mode_choices(
     };
     legal_next_modes_and_done_cached(
         state,
-        modal,
+        modal.as_ref(),
         &base_targets,
         &info,
         bounds,
         picked,
-        |modes| casting_mode_cost_ok_cached(state, cs, modal, modes, cache),
+        |modes| casting_mode_cost_ok_cached(state, cs, modal.as_ref(), modes, cache),
         cache,
     )
 }
@@ -1561,7 +1567,7 @@ pub fn advance_casting_state_machine(state: &mut GameState) -> Result<(), Engine
         match cs.step {
             CastStep::ChooseModes => {
                 let cache = state.evaluate_board();
-                if let Some(modal) = find_modal_def_cached(state, &cs, cache).cloned()
+                if let Some(modal) = find_modal_def_cached(state, &cs, cache).map(Cow::into_owned)
                     && cs.chosen_modes.is_empty()
                 {
                     let base_targets = base_target_specs_cached(state, &cs, cache);
@@ -2324,11 +2330,25 @@ fn finalize_cast_commit(state: &mut GameState, cs: CastingState) -> Result<(), E
             if is_loyalty && let Some(rare) = state.rare_or_default(cs.object) {
                 rare.used_loyalty_this_turn = true;
             }
-            let (is_once_turn, is_once_game) = {
+            let (is_once_turn, is_once_game, zero_bit) = {
                 let res =
                     resolve_activated_abilities_cached(state, cs.object, state.evaluate_board())
                         .into_iter()
                         .find(|r| r.ability_index == ability_index);
+                let equip_kw = crate::keywords::keyword_id_ci(state.db(), "equip");
+                let cycling_kw = crate::keywords::keyword_id_ci(state.db(), "cycling");
+                let mut z = 0u8;
+                if let Some(r) = res.as_ref() {
+                    if equip_kw.is_some() && r.ability.cost_keyword == equip_kw {
+                        z |= 1u8 << 0;
+                    }
+                    if r.ability.power_up_reduction {
+                        z |= 1u8 << 1;
+                    }
+                    if cycling_kw.is_some() && r.ability.cost_keyword == cycling_kw {
+                        z |= 1u8 << 2;
+                    }
+                }
                 (
                     res.as_ref().is_some_and(|r| {
                         r.grant_once_each_turn
@@ -2341,11 +2361,15 @@ fn finalize_cast_commit(state: &mut GameState, cs: CastingState) -> Result<(), E
                             .activation_restrictions
                             .contains(&mtg_ir::ActivationRestriction::OncePerGame)
                     }),
+                    z,
                 )
             };
-            if (is_once_turn || is_once_game)
+            if (is_once_turn || is_once_game || zero_bit != 0)
                 && let Some(p) = state.player_mut(cs.caster)
             {
+                if zero_bit != 0 {
+                    p.used_first_activation_zero_mask |= zero_bit;
+                }
                 if is_once_turn
                     && !p
                         .once_per_turn_abilities_used()

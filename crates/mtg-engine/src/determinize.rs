@@ -156,10 +156,12 @@ fn collect_viewer_prompt_pins(state: &GameState, viewer: PlayerId) -> Vec<Object
                 chooser,
                 candidates,
                 selected,
+                moved_ids,
                 ..
             } if *chooser == viewer => {
                 pins.extend_from_slice(candidates);
                 pins.extend_from_slice(selected);
+                pins.extend_from_slice(moved_ids);
             }
             StepPauseState::ReorderLibrary {
                 player,
@@ -181,11 +183,68 @@ fn collect_viewer_prompt_pins(state: &GameState, viewer: PlayerId) -> Vec<Object
                 revealed,
                 candidates,
                 selected,
+                partition_picks,
                 ..
             } if *player == viewer => {
                 pins.extend_from_slice(revealed);
                 pins.extend_from_slice(candidates);
                 pins.extend_from_slice(selected);
+                pins.extend_from_slice(partition_picks);
+            }
+            StepPauseState::MoveCountersSelectTarget {
+                chooser,
+                from_id,
+                candidates,
+                transfers,
+                ..
+            } if *chooser == viewer => {
+                pins.push(*from_id);
+                pins.extend_from_slice(candidates);
+                for &(tid, _) in transfers {
+                    pins.push(tid);
+                }
+            }
+            StepPauseState::MoveCountersChooseAmount {
+                chooser,
+                from_id,
+                candidates,
+                target_id,
+                transfers,
+                ..
+            } if *chooser == viewer => {
+                pins.push(*from_id);
+                pins.push(*target_id);
+                pins.extend_from_slice(candidates);
+                for &(tid, _) in transfers {
+                    pins.push(tid);
+                }
+            }
+            StepPauseState::WaitingOnReplacement {
+                batch_remaining,
+                batch_idx,
+                op_tag,
+            } if *op_tag == crate::effects::vm::OP_TAG_SEARCH => {
+                if let Some(cont) = vm.pending_continuation.as_deref()
+                    && cont.search_chooser == Some(viewer)
+                {
+                    if let Some(rem) = batch_remaining.get(*batch_idx..) {
+                        pins.extend_from_slice(rem);
+                    }
+                    pins.extend_from_slice(&cont.search_candidates);
+                    pins.extend_from_slice(&cont.search_moved_ids);
+                }
+            }
+            StepPauseState::WaitingOnReplacement {
+                batch_remaining,
+                batch_idx,
+                op_tag,
+            } if *op_tag == crate::effects::vm::OP_TAG_DIG => {
+                if let Some(cont) = vm.pending_continuation.as_deref()
+                    && cont.dig_player == Some(viewer)
+                    && let Some(rem) = batch_remaining.get(*batch_idx..)
+                {
+                    pins.extend_from_slice(rem);
+                }
             }
             _ => {}
         }
@@ -1447,6 +1506,516 @@ mod tests {
             assert!(exploited_lki.name.is_empty());
         } else {
             panic!("expected Exploited event");
+        }
+    }
+
+    fn make_search_rep_test_db() -> Arc<CardDatabase> {
+        let mut tables = InternTables::default();
+        tables.counters.push("+1/+1".into());
+        let make_plain =
+            |oracle_id: &str, name: &str, types: CardTypeMask, pt: Option<PrintedPt>| CardDef {
+                oracle_id: oracle_id.into(),
+                compiler_version: 46,
+                text_hash: "0".into(),
+                name: name.into(),
+                layout: CardLayout::Normal,
+                faces: vec![FaceDef {
+                    name: name.into(),
+                    characteristics: Characteristics {
+                        mana_cost: ManaCost::default(),
+                        types,
+                        subtypes: SmallVec::new(),
+                        supertypes: SupertypeMask::empty(),
+                        colors: ColorMask::G,
+                        color_indicator: None,
+                        pt,
+                        loyalty: None,
+                        defense: None,
+                    },
+                    abilities: vec![],
+                    has_read_ahead: false,
+                    prototype_spec: None,
+                    cleaved_spell_spec: None,
+                    gift_promised_spell_spec: None,
+                }],
+                fully_supported: true,
+            };
+        let make_bf_rep = |oracle_id: &str, name: &str, mod_spec: mtg_ir::ZoneChangeMod| CardDef {
+            oracle_id: oracle_id.into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: name.into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: name.into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::ENCHANTMENT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::W,
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![AbilityDef::Replacement(mtg_ir::ReplacementAbility {
+                    replacement: mtg_ir::ReplacementDef {
+                        replaces: mtg_ir::EventPattern {
+                            event: mtg_ir::EventKind::ZoneChange,
+                            filter: mtg_ir::EventFilter {
+                                detail: Some(mtg_ir::EventDetail::ZoneChange {
+                                    from: mtg_ir::ZoneMask::LIBRARY,
+                                    to: Some(Zone::Battlefield),
+                                    from_anywhere: false,
+                                    not_from_zone: None,
+                                    not_to_zone: None,
+                                    enters_untapped: false,
+                                    dealt_damage_by_self_this_turn: false,
+                                }),
+                                ..Default::default()
+                            },
+                        },
+                        with: mtg_ir::ReplacementWith::ZoneChange {
+                            mod_spec: Box::new(mod_spec),
+                        },
+                        self_replacement: false,
+                        who: None,
+                        condition: None,
+                    },
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+        let land = make_plain(
+            "synth_search_land",
+            "Synth Search Land",
+            CardTypeMask::LAND,
+            None,
+        );
+        let bear = make_plain(
+            "synth_search_bear",
+            "Synth Search Bear",
+            CardTypeMask::CREATURE,
+            Some(PrintedPt::Fixed {
+                power: 2,
+                toughness: 2,
+            }),
+        );
+        let rep_tap = make_bf_rep(
+            "synth_rep_bf_tap",
+            "Synth Rep Bf Tap",
+            mtg_ir::ZoneChangeMod {
+                tapped: Some(true),
+                ..Default::default()
+            },
+        );
+        let rep_ctr = make_bf_rep(
+            "synth_rep_bf_ctr",
+            "Synth Rep Bf Ctr",
+            mtg_ir::ZoneChangeMod {
+                counters: Some((
+                    mtg_ir::CounterId(0),
+                    Box::new(mtg_ir::Amount::Const { n: 1 }),
+                )),
+                ..Default::default()
+            },
+        );
+        Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![land, bear, rep_tap, rep_ctr],
+                decks: vec![],
+            })
+            .unwrap(),
+        )
+    }
+
+    fn make_search_step(
+        destinations: Vec<mtg_ir::SearchDestination>,
+        count: u16,
+    ) -> mtg_ir::EffectStep {
+        mtg_ir::EffectStep {
+            op: mtg_ir::EffectOp::Search {
+                spec: Box::new(mtg_ir::SearchSpec {
+                    filter: Box::new(mtg_ir::ObjectFilter {
+                        types_any: CardTypeMask::LAND,
+                        ..Default::default()
+                    }),
+                    count,
+                    up_to: true,
+                    stated_quality: true,
+                    destinations,
+                    reveal: false,
+                    description: None,
+                    zones: mtg_ir::ZoneMask::LIBRARY,
+                    different_names: false,
+                    shuffle_only_if_library: false,
+                    searched_player: None,
+                    cast_free: false,
+                    target_controller_as_actor: false,
+                }),
+                tapped: false,
+            },
+            subject: mtg_ir::Selector::None,
+            actor: None,
+            amount: None,
+            optional: None,
+            gate: None,
+            bind_as: None,
+            do_this_once_per_turn: false,
+            reflexive_trigger: None,
+            span: Default::default(),
+        }
+    }
+
+    #[test]
+    fn synth_determinize_pins_multi_dest_search_during_waiting_on_replacement_and_redacts_opponent()
+    {
+        let db = make_search_rep_test_db();
+        let mut mainboard = vec![CardDefId(1); 10];
+        mainboard.extend([CardDefId(0), CardDefId(0), CardDefId(0)]);
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard,
+            sideboard: vec![],
+        };
+        let mut cfg = GameConfig::standard_1v1();
+        cfg.starting_hand_size = 0;
+        let mut state = GameState::new(db, cfg, &[deck.clone(), deck], 17).unwrap();
+
+        for cd in [CardDefId(2), CardDefId(3)] {
+            let ts = state.allocate_timestamp();
+            let id = state.insert_object(
+                crate::state::GameObject::new(
+                    cd,
+                    PlayerId(0),
+                    Zone::Battlefield,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+        }
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let step = make_search_step(
+            vec![
+                mtg_ir::SearchDestination {
+                    zone: Zone::Battlefield,
+                    tapped: false,
+                    on_top: false,
+                },
+                mtg_ir::SearchDestination {
+                    zone: Zone::Hand,
+                    tapped: false,
+                    on_top: false,
+                },
+            ],
+            2,
+        );
+
+        let out1 = crate::effects::begin_resolution_frame(
+            &mut state,
+            crate::id::StackItemId(701),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![step],
+            vec![],
+        )
+        .unwrap();
+        let crate::effects::FrameOutcome::Paused { prompt_id: p1, .. } = out1 else {
+            panic!("expected SearchPick prompt, got {out1:?}");
+        };
+        let picked_land = match &state.pending_prompt().unwrap().request {
+            ChoiceRequest::ChooseObjects { candidates, .. } => {
+                assert_eq!(candidates.len(), 3);
+                candidates[0]
+            }
+            other => panic!("expected ChooseObjects, got {other:?}"),
+        };
+
+        let out2 = crate::effects::resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p1,
+            crate::action::ChoiceAnswer::PickObject { id: picked_land },
+        )
+        .unwrap();
+        let crate::effects::FrameOutcome::Paused {
+            prompt_id: rep_pid, ..
+        } = out2
+        else {
+            panic!("expected WaitingOnReplacement pause, got {out2:?}");
+        };
+
+        let rem_candidates = state
+            .resolution_vms()
+            .last()
+            .and_then(|v| v.pending_continuation.as_ref())
+            .expect("pending_continuation must exist")
+            .search_candidates
+            .clone();
+        assert_eq!(rem_candidates.len(), 2);
+        let rem_land = rem_candidates[0];
+        assert!(!is_known_to(&state, rem_land, PlayerId(0)));
+
+        // Chooser visibility + opponent redaction during WaitingOnReplacement:
+        assert!(crate::observe::is_object_visible_to(
+            &state,
+            rem_land,
+            Some(PlayerId(0))
+        ));
+        assert!(crate::observe::is_object_visible_to(
+            &state,
+            picked_land,
+            Some(PlayerId(0))
+        ));
+        assert!(!crate::observe::is_object_visible_to(
+            &state,
+            rem_land,
+            Some(PlayerId(1))
+        ));
+        assert!(!crate::observe::is_object_visible_to(
+            &state,
+            picked_land,
+            Some(PlayerId(1))
+        ));
+        let obs_opp = crate::observe::observe_state(&state, PlayerId(1), vec![]);
+        assert!(
+            !obs_opp
+                .entities
+                .iter()
+                .any(|e| e.zone == Zone::Library || e.zone == Zone::Hand)
+        );
+
+        // Chooser determinization pins picked_land and all rem_candidates across 16 seeds:
+        for s in 1..=16u64 {
+            let mut rng = RngState::splitmix64(s);
+            let mut det = determinize_state(&state, PlayerId(0), &mut rng);
+            assert_eq!(det.object(picked_land).unwrap().card_def, CardDefId(0));
+            for &cid in &rem_candidates {
+                assert_eq!(
+                    det.object(cid).unwrap().card_def,
+                    CardDefId(0),
+                    "rem_candidate must stay Land in chooser determinization"
+                );
+            }
+            if s == 1 {
+                let rep_out = crate::replace::resume_and_finalize_replacement(
+                    &mut det,
+                    PlayerId(0),
+                    rep_pid,
+                    crate::action::ChoiceAnswer::PickReplacement { index: 0 },
+                )
+                .unwrap();
+                let res2 = crate::effects::resume_after_replacement(&mut det, rep_out).unwrap();
+                let crate::effects::FrameOutcome::Paused { prompt_id: p2, .. } = res2 else {
+                    panic!("expected second SearchPick prompt, got {res2:?}");
+                };
+                let cands2 = match &det.pending_prompt().unwrap().request {
+                    ChoiceRequest::ChooseObjects { candidates, .. } => candidates.clone(),
+                    other => panic!("expected ChooseObjects, got {other:?}"),
+                };
+                assert_eq!(cands2.len(), 2);
+                for &c in &cands2 {
+                    assert_eq!(det.object(c).unwrap().card_def, CardDefId(0));
+                }
+                let res3 = crate::effects::resume_resolution_frame(
+                    &mut det,
+                    PlayerId(0),
+                    p2,
+                    crate::action::ChoiceAnswer::PickObject { id: cands2[0] },
+                )
+                .unwrap();
+                assert_eq!(res3, crate::effects::FrameOutcome::Completed);
+                assert_eq!(det.player(PlayerId(0)).unwrap().hand.len(), 1);
+                let hand_card = det.player(PlayerId(0)).unwrap().hand[0];
+                assert_eq!(det.object(hand_card).unwrap().card_def, CardDefId(0));
+            }
+        }
+
+        // Opponent determinization does NOT pin P0's library:
+        let mut saw_resampled = false;
+        for s in 1..=16u64 {
+            let mut rng = RngState::splitmix64(s);
+            let det_opp = determinize_state(&state, PlayerId(1), &mut rng);
+            let p0_lib = &det_opp.player(PlayerId(0)).unwrap().library;
+            let land_cnt = p0_lib
+                .iter()
+                .filter(|&&id| det_opp.object(id).unwrap().card_def == CardDefId(0))
+                .count();
+            assert_eq!(land_cnt, 3);
+            if det_opp.object(rem_land).unwrap().card_def != CardDefId(0) {
+                saw_resampled = true;
+            }
+        }
+        assert!(
+            saw_resampled,
+            "opponent determinization must be able to resample P0 library slots"
+        );
+    }
+
+    #[test]
+    fn synth_determinize_pins_single_dest_multi_pick_search_during_waiting_on_replacement() {
+        let db = make_search_rep_test_db();
+        let mut mainboard = vec![CardDefId(1); 10];
+        mainboard.extend([CardDefId(0), CardDefId(0), CardDefId(0)]);
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard,
+            sideboard: vec![],
+        };
+        let mut cfg = GameConfig::standard_1v1();
+        cfg.starting_hand_size = 0;
+        let mut state = GameState::new(db, cfg, &[deck.clone(), deck], 23).unwrap();
+
+        for cd in [CardDefId(2), CardDefId(3)] {
+            let ts = state.allocate_timestamp();
+            let id = state.insert_object(
+                crate::state::GameObject::new(
+                    cd,
+                    PlayerId(0),
+                    Zone::Battlefield,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+        }
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let step = make_search_step(
+            vec![mtg_ir::SearchDestination {
+                zone: Zone::Battlefield,
+                tapped: false,
+                on_top: false,
+            }],
+            2,
+        );
+
+        let out1 = crate::effects::begin_resolution_frame(
+            &mut state,
+            crate::id::StackItemId(702),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![step],
+            vec![],
+        )
+        .unwrap();
+        let crate::effects::FrameOutcome::Paused { prompt_id: p1, .. } = out1 else {
+            panic!("expected SearchPick prompt 1, got {out1:?}");
+        };
+        let lands: Vec<ObjectId> = match &state.pending_prompt().unwrap().request {
+            ChoiceRequest::ChooseObjects { candidates, .. } => candidates.clone(),
+            other => panic!("expected ChooseObjects, got {other:?}"),
+        };
+        let land_0 = lands[0];
+        let land_1 = lands[1];
+
+        let out2 = crate::effects::resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p1,
+            crate::action::ChoiceAnswer::PickObject { id: land_0 },
+        )
+        .unwrap();
+        let crate::effects::FrameOutcome::Paused { prompt_id: p2, .. } = out2 else {
+            panic!("expected SearchPick prompt 2, got {out2:?}");
+        };
+        let out3 = crate::effects::resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p2,
+            crate::action::ChoiceAnswer::PickObject { id: land_1 },
+        )
+        .unwrap();
+        let crate::effects::FrameOutcome::Paused {
+            prompt_id: rep_pid, ..
+        } = out3
+        else {
+            panic!("expected WaitingOnReplacement pause, got {out3:?}");
+        };
+
+        assert!(crate::observe::is_object_visible_to(
+            &state,
+            land_0,
+            Some(PlayerId(0))
+        ));
+        assert!(crate::observe::is_object_visible_to(
+            &state,
+            land_1,
+            Some(PlayerId(0))
+        ));
+        assert!(!crate::observe::is_object_visible_to(
+            &state,
+            land_0,
+            Some(PlayerId(1))
+        ));
+        assert!(!crate::observe::is_object_visible_to(
+            &state,
+            land_1,
+            Some(PlayerId(1))
+        ));
+
+        for s in 1..=16u64 {
+            let mut rng = RngState::splitmix64(s);
+            let mut det = determinize_state(&state, PlayerId(0), &mut rng);
+            assert_eq!(det.object(land_0).unwrap().card_def, CardDefId(0));
+            assert_eq!(det.object(land_1).unwrap().card_def, CardDefId(0));
+            if s == 1 {
+                let rep_out = crate::replace::resume_and_finalize_replacement(
+                    &mut det,
+                    PlayerId(0),
+                    rep_pid,
+                    crate::action::ChoiceAnswer::PickReplacement { index: 0 },
+                )
+                .unwrap();
+                let res2 = crate::effects::resume_after_replacement(&mut det, rep_out).unwrap();
+                let crate::effects::FrameOutcome::Paused {
+                    prompt_id: rep_pid2,
+                    ..
+                } = res2
+                else {
+                    panic!("expected second WaitingOnReplacement pause for land_1, got {res2:?}");
+                };
+                let rep_out2 = crate::replace::resume_and_finalize_replacement(
+                    &mut det,
+                    PlayerId(0),
+                    rep_pid2,
+                    crate::action::ChoiceAnswer::PickReplacement { index: 0 },
+                )
+                .unwrap();
+                let res3 = crate::effects::resume_after_replacement(&mut det, rep_out2).unwrap();
+                assert_eq!(res3, crate::effects::FrameOutcome::Completed);
+                let bf_lands = det
+                    .player(PlayerId(0))
+                    .unwrap()
+                    .battlefield
+                    .iter()
+                    .filter(|&&id| det.object(id).unwrap().card_def == CardDefId(0))
+                    .count();
+                assert_eq!(bf_lands, 2);
+            }
         }
     }
 }

@@ -606,23 +606,114 @@ pub fn resume_combat_prompt(
     prompt_id: u32,
     answer: ChoiceAnswer,
 ) -> Result<CombatOutcome, EngineError> {
-    let Some(pp) = state.take_pending_prompt() else {
+    let Some(pp) = state.pending_prompt() else {
         return Err(EngineError::IllegalAction(
             "no pending combat prompt to resume".into(),
         ));
     };
     if pp.chooser != actor || pp.prompt_id != prompt_id {
-        state.set_pending_prompt(Some(pp));
         return Err(EngineError::IllegalAction(
             "combat prompt actor or prompt_id mismatch".into(),
         ));
     }
+    let PromptOwner::Combat(ref kind) = pp.owner else {
+        return Err(EngineError::IllegalAction(
+            "pending prompt is not owned by combat".into(),
+        ));
+    };
+
+    match kind {
+        CombatPromptKind::DamageAssignmentOrder {
+            unordered_blockers, ..
+        } => {
+            let ChoiceAnswer::OrderNext { id } = answer else {
+                return Err(EngineError::IllegalAction(
+                    "expected OrderNext answer for DamageAssignmentOrder".into(),
+                ));
+            };
+            if !unordered_blockers.contains(&id) {
+                return Err(EngineError::IllegalAction(
+                    "ordered blocker is not in remaining candidates".into(),
+                ));
+            }
+        }
+        CombatPromptKind::SuperTrampleAsUnblocked { .. } => {
+            if !matches!(answer, ChoiceAnswer::YesNo { .. }) {
+                return Err(EngineError::IllegalAction(
+                    "expected YesNo for SuperTrampleAsUnblocked".into(),
+                ));
+            }
+            if state.combat().pending_damage.is_none() {
+                return Err(EngineError::IllegalAction(
+                    "missing pending combat damage state".into(),
+                ));
+            }
+        }
+        CombatPromptKind::AttackerDamageDivide { .. } => {
+            let ChoiceAnswer::PickNumber { value } = answer else {
+                return Err(EngineError::IllegalAction(
+                    "expected PickNumber for AttackerDamageDivide".into(),
+                ));
+            };
+            let ChoiceRequest::ChooseNumber { min, max, .. } = pp.request else {
+                return Err(EngineError::IllegalAction(
+                    "corrupted request shape for AttackerDamageDivide".into(),
+                ));
+            };
+            if value < min || value > max {
+                return Err(EngineError::IllegalAction(
+                    "damage assignment out of legal range".into(),
+                ));
+            }
+            if state.combat().pending_damage.is_none() {
+                return Err(EngineError::IllegalAction(
+                    "missing pending combat damage state".into(),
+                ));
+            }
+        }
+        CombatPromptKind::BlockerDamageDivide { .. } => {
+            let ChoiceAnswer::PickNumber { value } = answer else {
+                return Err(EngineError::IllegalAction(
+                    "expected PickNumber for BlockerDamageDivide".into(),
+                ));
+            };
+            let ChoiceRequest::ChooseNumber { min, max, .. } = pp.request else {
+                return Err(EngineError::IllegalAction(
+                    "corrupted request shape for BlockerDamageDivide".into(),
+                ));
+            };
+            if value < min || value > max {
+                return Err(EngineError::IllegalAction(
+                    "blocker damage assignment out of legal range".into(),
+                ));
+            }
+            if state.combat().pending_damage.is_none() {
+                return Err(EngineError::IllegalAction(
+                    "missing pending combat damage state".into(),
+                ));
+            }
+        }
+        CombatPromptKind::AttackTaxPay | CombatPromptKind::BlockTaxPay => {
+            return Err(EngineError::IllegalAction(
+                "unexpected tax prompt state".into(),
+            ));
+        }
+    }
+
+    let Some(pp) = state.take_pending_prompt() else {
+        return Err(EngineError::IllegalAction(
+            "no pending combat prompt to resume".into(),
+        ));
+    };
     let PromptOwner::Combat(kind) = pp.owner else {
         state.set_pending_prompt(Some(pp));
         return Err(EngineError::IllegalAction(
             "pending prompt is not owned by combat".into(),
         ));
     };
+    if matches!(state.decision(), DecisionState::Prompt { .. }) {
+        state.set_decision(DecisionState::Priority);
+    }
 
     match kind {
         CombatPromptKind::DamageAssignmentOrder {
@@ -709,16 +800,6 @@ pub fn resume_combat_prompt(
                     "expected PickNumber for AttackerDamageDivide".into(),
                 ));
             };
-            let ChoiceRequest::ChooseNumber { min, max, .. } = pp.request else {
-                return Err(EngineError::IllegalAction(
-                    "corrupted request shape for AttackerDamageDivide".into(),
-                ));
-            };
-            if value < min || value > max {
-                return Err(EngineError::IllegalAction(
-                    "damage assignment out of legal range".into(),
-                ));
-            }
             let Some(mut pending) = state.combat_mut().pending_damage.take() else {
                 return Err(EngineError::IllegalAction(
                     "missing pending combat damage state".into(),
@@ -782,16 +863,6 @@ pub fn resume_combat_prompt(
                     "expected PickNumber for BlockerDamageDivide".into(),
                 ));
             };
-            let ChoiceRequest::ChooseNumber { min, max, .. } = pp.request else {
-                return Err(EngineError::IllegalAction(
-                    "corrupted request shape for BlockerDamageDivide".into(),
-                ));
-            };
-            if value < min || value > max {
-                return Err(EngineError::IllegalAction(
-                    "blocker damage assignment out of legal range".into(),
-                ));
-            }
             let Some(mut pending) = state.combat_mut().pending_damage.take() else {
                 return Err(EngineError::IllegalAction(
                     "missing pending combat damage state".into(),
@@ -7491,5 +7562,463 @@ mod tests {
                 .flags
                 .contains(ObjectFlags::TAPPED)
         );
+    }
+
+    #[test]
+    fn synth_combat_prompt_invalid_answer_preserves_prompt_and_flushes_block_triggers() {
+        let tables = InternTables::default();
+        let plains = CardDef {
+            oracle_id: "synth_combat_block_trig_plains".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Combat Block Trig Plains".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Combat Block Trig Plains".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::LAND,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::BASIC,
+                    colors: ColorMask::empty(),
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+        let trig_attacker = CardDef {
+            oracle_id: "synth_becomes_blocked_attacker".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Becomes Blocked Attacker".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Becomes Blocked Attacker".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::CREATURE,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::G,
+                    color_indicator: None,
+                    pt: Some(mtg_ir::PrintedPt::Fixed {
+                        power: 4,
+                        toughness: 4,
+                    }),
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![mtg_ir::AbilityDef::Triggered(mtg_ir::TriggeredAbility {
+                    trigger: mtg_ir::TriggerDef {
+                        event: mtg_ir::EventKind::BecomesBlocked,
+                        filter: mtg_ir::EventFilter {
+                            object: Some(mtg_ir::TriggerSubject::SelfObj),
+                            ..Default::default()
+                        },
+                        scope: None,
+                        from_zones: None,
+                        only_once_per_turn: false,
+                        do_this_once_per_turn: false,
+                        is_state_trigger: false,
+                        or: vec![],
+                        chapter_numbers: SmallVec::new(),
+                        is_chapter_ability: false,
+                        spell_delayed: None,
+                    },
+                    condition: None,
+                    grant_condition: None,
+                    targets: vec![],
+                    effect: vec![mtg_ir::EffectStep {
+                        op: mtg_ir::EffectOp::GainLife {
+                            set_life_total: false,
+                        },
+                        subject: mtg_ir::Selector::PlayerRef {
+                            player: mtg_ir::PlayerRef::You,
+                        },
+                        actor: None,
+                        amount: Some(Box::new(mtg_ir::Amount::Const { n: 2 })),
+                        optional: None,
+                        gate: None,
+                        bind_as: None,
+                        do_this_once_per_turn: false,
+                        reflexive_trigger: None,
+                        span: Default::default(),
+                    }],
+                    modal: None,
+                    text: None,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![plains, trig_attacker],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 20],
+            sideboard: vec![],
+        };
+        let mut state =
+            GameState::new(db, GameConfig::standard_1v1(), &[deck.clone(), deck], 37).unwrap();
+        state.set_phase(mtg_ir::GamePhase::BeginCombat);
+        state.set_decision(DecisionState::Priority);
+
+        let ts_atk = state.allocate_timestamp();
+        let atk = state.insert_object(
+            crate::state::GameObject::new(
+                CardDefId(1),
+                PlayerId(0),
+                Zone::Battlefield,
+                ts_atk,
+                ObjectFlags::empty(),
+            ),
+            None,
+        );
+        state.player_mut(PlayerId(0)).unwrap().battlefield.push(atk);
+        state.mark_dirty(DirtyMask::TOPOLOGY);
+
+        let b1 = spawn_creature(&mut state, PlayerId(1), "Synth Guard A", 2, 2, &[]);
+        let b2 = spawn_creature(&mut state, PlayerId(1), "Synth Guard B", 2, 2, &[]);
+
+        enter_declare_attackers_step(&mut state).unwrap();
+        apply_combat_action(
+            &mut state,
+            PlayerId(0),
+            &Action::AssignAttacker {
+                attacker: atk,
+                target: AttackTarget::Player { id: PlayerId(1) },
+            },
+        )
+        .unwrap();
+        apply_combat_action(&mut state, PlayerId(0), &Action::ConfirmAttackers).unwrap();
+        enter_declare_blockers_step(&mut state).unwrap();
+
+        apply_combat_action(
+            &mut state,
+            PlayerId(1),
+            &Action::AssignBlocker {
+                blocker: b1,
+                attacker: atk,
+            },
+        )
+        .unwrap();
+        apply_combat_action(
+            &mut state,
+            PlayerId(1),
+            &Action::AssignBlocker {
+                blocker: b2,
+                attacker: atk,
+            },
+        )
+        .unwrap();
+        let out = apply_combat_action(&mut state, PlayerId(1), &Action::ConfirmBlockers).unwrap();
+        let CombatOutcome::Paused { prompt_id, chooser } = out else {
+            panic!("expected DamageAssignmentOrder pause, got {out:?}");
+        };
+        assert_eq!(chooser, PlayerId(0));
+        let pp = state.pending_prompt().unwrap().clone();
+
+        // Invalid ChoiceAnswer variant + out-of-set candidate preserve prompt & legal actions.
+        for bad in [
+            ChoiceAnswer::YesNo { value: true },
+            ChoiceAnswer::OrderNext { id: atk },
+        ] {
+            assert!(
+                crate::choices::apply_choice_answer(&mut state, PlayerId(0), prompt_id, bad)
+                    .is_err()
+            );
+            assert!(crate::choices::is_prompt_active(&state));
+            assert_eq!(state.pending_prompt(), Some(&pp));
+            assert!(matches!(state.decision(), DecisionState::Prompt { .. }));
+            let legal = crate::choices::legal_choice_actions(&state, PlayerId(0));
+            let order_ids: Vec<ObjectId> = legal
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Answer {
+                        answer: ChoiceAnswer::OrderNext { id },
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(order_ids, vec![b1, b2]);
+        }
+
+        // Valid answer completes ordering, clears DecisionState::Prompt -> Priority, and flushes BecomesBlocked trigger!
+        crate::choices::apply_choice_answer(
+            &mut state,
+            PlayerId(0),
+            prompt_id,
+            ChoiceAnswer::OrderNext { id: b1 },
+        )
+        .unwrap();
+        assert!(state.pending_prompt().is_none());
+        assert_eq!(state.decision(), &DecisionState::Priority);
+        assert_eq!(state.stack().len(), 1);
+        assert!(state.pending_triggers().is_empty());
+    }
+
+    #[test]
+    fn synth_combat_damage_divide_invalid_answer_preserves_prompt() {
+        let tables = InternTables::default();
+        let plains = CardDef {
+            oracle_id: "synth_combat_div_plains".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Combat Div Plains".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Combat Div Plains".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::LAND,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::BASIC,
+                    colors: ColorMask::empty(),
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+        let dying_blocker = CardDef {
+            oracle_id: "synth_dying_blocker".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Dying Blocker".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Dying Blocker".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::CREATURE,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::W,
+                    color_indicator: None,
+                    pt: Some(mtg_ir::PrintedPt::Fixed {
+                        power: 2,
+                        toughness: 2,
+                    }),
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![mtg_ir::AbilityDef::Triggered(mtg_ir::TriggeredAbility {
+                    trigger: mtg_ir::TriggerDef {
+                        event: mtg_ir::EventKind::ZoneChange,
+                        filter: mtg_ir::EventFilter {
+                            object: Some(mtg_ir::TriggerSubject::SelfObj),
+                            detail: Some(mtg_ir::EventDetail::ZoneChange {
+                                from: mtg_ir::ZoneMask::BATTLEFIELD,
+                                to: Some(Zone::Graveyard),
+                                from_anywhere: false,
+                                not_from_zone: None,
+                                not_to_zone: None,
+                                enters_untapped: false,
+                                dealt_damage_by_self_this_turn: false,
+                            }),
+                            ..Default::default()
+                        },
+                        scope: None,
+                        from_zones: None,
+                        only_once_per_turn: false,
+                        do_this_once_per_turn: false,
+                        is_state_trigger: false,
+                        or: vec![],
+                        chapter_numbers: SmallVec::new(),
+                        is_chapter_ability: false,
+                        spell_delayed: None,
+                    },
+                    condition: None,
+                    grant_condition: None,
+                    targets: vec![],
+                    effect: vec![mtg_ir::EffectStep {
+                        op: mtg_ir::EffectOp::GainLife {
+                            set_life_total: false,
+                        },
+                        subject: mtg_ir::Selector::PlayerRef {
+                            player: mtg_ir::PlayerRef::You,
+                        },
+                        actor: None,
+                        amount: Some(Box::new(mtg_ir::Amount::Const { n: 1 })),
+                        optional: None,
+                        gate: None,
+                        bind_as: None,
+                        do_this_once_per_turn: false,
+                        reflexive_trigger: None,
+                        span: Default::default(),
+                    }],
+                    modal: None,
+                    text: None,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![plains, dying_blocker],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 20],
+            sideboard: vec![],
+        };
+        let mut state =
+            GameState::new(db, GameConfig::standard_1v1(), &[deck.clone(), deck], 41).unwrap();
+        state.set_phase(mtg_ir::GamePhase::BeginCombat);
+        state.set_decision(DecisionState::Priority);
+
+        let atk = spawn_creature(&mut state, PlayerId(0), "Synth Titan", 5, 5, &[]);
+        let ts_b1 = state.allocate_timestamp();
+        let b1 = state.insert_object(
+            crate::state::GameObject::new(
+                CardDefId(1),
+                PlayerId(1),
+                Zone::Battlefield,
+                ts_b1,
+                ObjectFlags::empty(),
+            ),
+            None,
+        );
+        state.player_mut(PlayerId(1)).unwrap().battlefield.push(b1);
+        state.mark_dirty(DirtyMask::TOPOLOGY);
+        let b2 = spawn_creature(&mut state, PlayerId(1), "Synth Guard Two", 2, 2, &[]);
+
+        enter_declare_attackers_step(&mut state).unwrap();
+        apply_combat_action(
+            &mut state,
+            PlayerId(0),
+            &Action::AssignAttacker {
+                attacker: atk,
+                target: AttackTarget::Player { id: PlayerId(1) },
+            },
+        )
+        .unwrap();
+        apply_combat_action(&mut state, PlayerId(0), &Action::ConfirmAttackers).unwrap();
+        enter_declare_blockers_step(&mut state).unwrap();
+
+        apply_combat_action(
+            &mut state,
+            PlayerId(1),
+            &Action::AssignBlocker {
+                blocker: b1,
+                attacker: atk,
+            },
+        )
+        .unwrap();
+        apply_combat_action(
+            &mut state,
+            PlayerId(1),
+            &Action::AssignBlocker {
+                blocker: b2,
+                attacker: atk,
+            },
+        )
+        .unwrap();
+        let out_blk =
+            apply_combat_action(&mut state, PlayerId(1), &Action::ConfirmBlockers).unwrap();
+        let CombatOutcome::Paused {
+            prompt_id: ord_pid, ..
+        } = out_blk
+        else {
+            panic!("expected DamageAssignmentOrder pause");
+        };
+        apply_combat_prompt_answer(
+            &mut state,
+            PlayerId(0),
+            ord_pid,
+            ChoiceAnswer::OrderNext { id: b1 },
+        );
+
+        state.set_phase(mtg_ir::GamePhase::CombatDamage);
+        let out_dmg = execute_combat_damage_step(&mut state, false).unwrap();
+        let CombatOutcome::Paused {
+            prompt_id: div_pid,
+            chooser,
+        } = out_dmg
+        else {
+            panic!("expected AttackerDamageDivide pause, got {out_dmg:?}");
+        };
+        assert_eq!(chooser, PlayerId(0));
+        let pp = state.pending_prompt().unwrap().clone();
+        assert!(matches!(
+            pp.owner,
+            PromptOwner::Combat(CombatPromptKind::AttackerDamageDivide { .. })
+        ));
+
+        for bad in [
+            ChoiceAnswer::YesNo { value: true },
+            ChoiceAnswer::PickNumber { value: 1 },
+            ChoiceAnswer::PickNumber { value: 99 },
+        ] {
+            assert!(
+                crate::choices::apply_choice_answer(&mut state, PlayerId(0), div_pid, bad).is_err()
+            );
+            assert!(crate::choices::is_prompt_active(&state));
+            assert_eq!(state.pending_prompt(), Some(&pp));
+            assert!(matches!(state.decision(), DecisionState::Prompt { .. }));
+            assert!(state.combat().pending_damage.is_some());
+        }
+
+        // Valid PickNumber { value: 3 } resolves combat damage (b1=3, b2=2), kills both blockers, and flushes b1's death trigger onto stack!
+        crate::choices::apply_choice_answer(
+            &mut state,
+            PlayerId(0),
+            div_pid,
+            ChoiceAnswer::PickNumber { value: 3 },
+        )
+        .unwrap();
+        assert!(state.pending_prompt().is_none());
+        assert_eq!(state.decision(), &DecisionState::Priority);
+        assert!(state.combat().pending_damage.is_none());
+        assert_eq!(state.stack().len(), 1);
+        assert!(state.pending_triggers().is_empty());
+    }
+
+    fn apply_combat_prompt_answer(
+        state: &mut GameState,
+        actor: PlayerId,
+        prompt_id: u32,
+        answer: ChoiceAnswer,
+    ) {
+        crate::choices::apply_choice_answer(state, actor, prompt_id, answer).unwrap();
     }
 }

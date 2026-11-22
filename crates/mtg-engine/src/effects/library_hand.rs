@@ -14,7 +14,7 @@ use crate::id::{ObjectId, PlayerId};
 use crate::mana;
 use crate::replace::{self, ReplacementOutcome, ReplacementResult};
 use crate::state::{
-    ControlFlowFrame, DirtyMask, EngineError, FaceDownKind, FaceDownSpec, GameState,
+    ControlFlowFrame, DigMoveRole, DirtyMask, EngineError, FaceDownKind, FaceDownSpec, GameState,
     ModePausePurpose, NumberPausePurpose, PendingPromptContext, PendingStepContinuation,
     PlayableFromExileState, PromptOwner, ReorderMode, StepPauseState, YesNoPausePurpose,
 };
@@ -22,7 +22,7 @@ use crate::zones::{self, CreateTokenOptions, MoveObjectOutcome, MoveRawOptions, 
 
 use super::counters_mods::apply_resolved_put_counters;
 use super::vm::{
-    OP_TAG_DRAW, OP_TAG_SEARCH, SelectionResult, StepExecOutcome, append_step_binding,
+    OP_TAG_DIG, OP_TAG_DRAW, OP_TAG_SEARCH, SelectionResult, StepExecOutcome, append_step_binding,
     move_opts_for_zone, record_step_bindings, resolve_selection_mod, resolve_selector_objects,
     resolve_step_actor, resolve_step_amount, resolve_target_players, set_waiting_on_replacement,
     vm_controller, vm_source, with_vm_eval,
@@ -828,8 +828,17 @@ pub(crate) fn exec_search(
         });
     }
 
-    let eff_tapped = tapped || spec.destinations.first().is_some_and(|d| d.tapped);
-    let max = spec.count.min(candidates.len() as u16);
+    let is_multi_dest = spec.destinations.len() > 1;
+    let eff_tapped = if is_multi_dest {
+        false
+    } else {
+        tapped || spec.destinations.first().is_some_and(|d| d.tapped)
+    };
+    let max = if is_multi_dest {
+        if candidates.is_empty() { 0 } else { 1 }
+    } else {
+        spec.count.min(candidates.len() as u16)
+    };
     if max == 0 || candidates.is_empty() {
         return finalize_search_picks(
             state,
@@ -859,6 +868,8 @@ pub(crate) fn exec_search(
             min,
             max,
             destinations: spec.destinations.clone(),
+            dest_idx: 0,
+            moved_ids: Vec::new(),
             shuffle_library,
             reveal: spec.reveal,
             tapped: eff_tapped,
@@ -882,6 +893,228 @@ pub(crate) fn exec_search(
     state.set_decision(DecisionState::Prompt { request: req });
     state.set_priority_player(chooser);
     Ok(StepExecOutcome::Paused { prompt_id, chooser })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_multi_dest_search(
+    state: &mut GameState,
+    step: &EffectStep,
+    searched_player: PlayerId,
+    moved_ids: Vec<ObjectId>,
+    shuffle_library: bool,
+) -> Result<StepExecOutcome, EngineError> {
+    if shuffle_library {
+        zones::shuffle_library(state, searched_player, 0)?;
+        emit_event(
+            state,
+            AtomicEventKind::LibraryShuffled {
+                player: searched_player,
+            },
+        );
+    }
+    emit_event(
+        state,
+        AtomicEventKind::LibrarySearched {
+            player: searched_player,
+        },
+    );
+    if moved_ids.is_empty() {
+        record_step_bindings(state, step.bind_as.as_deref(), &[]);
+    }
+    if let Some(vm) = state.resolution_vms_mut().last_mut() {
+        vm.pending_continuation = None;
+    }
+    Ok(StepExecOutcome::Done)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn continue_or_finish_multi_dest_search(
+    state: &mut GameState,
+    step: &EffectStep,
+    chooser: PlayerId,
+    searched_player: PlayerId,
+    mut rem_candidates: Vec<ObjectId>,
+    destinations: Vec<SearchDestination>,
+    next_dest_idx: usize,
+    moved_ids: Vec<ObjectId>,
+    shuffle_library: bool,
+    reveal: bool,
+) -> Result<StepExecOutcome, EngineError> {
+    rem_candidates.retain(|&id| state.object(id).is_some());
+    if next_dest_idx < destinations.len() && !rem_candidates.is_empty() {
+        let next_min = if let mtg_ir::EffectOp::Search { spec, .. } = &step.op {
+            if spec.up_to || spec.stated_quality {
+                0
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        let next_pid = state.allocate_prompt_id();
+        if let Some(vm) = state.resolution_vms_mut().last_mut() {
+            vm.pause_state = Some(StepPauseState::SearchPick {
+                chooser,
+                searched_player,
+                candidates: rem_candidates.clone(),
+                selected: Vec::new(),
+                min: next_min,
+                max: 1,
+                destinations,
+                dest_idx: next_dest_idx,
+                moved_ids,
+                shuffle_library,
+                reveal,
+                tapped: false,
+            });
+        }
+        if let Some(fr) = state.resolution_frames_mut().last_mut() {
+            fr.pending_prompt_id = Some(next_pid);
+        }
+        let req = ChoiceRequest::ChooseObjects {
+            prompt_id: next_pid,
+            candidates: rem_candidates,
+            min: next_min,
+            max: 1,
+        };
+        state.set_pending_prompt(Some(PendingPromptContext {
+            prompt_id: next_pid,
+            chooser,
+            request: req.clone(),
+            owner: PromptOwner::ResolutionFrame,
+        }));
+        state.set_decision(DecisionState::Prompt { request: req });
+        state.set_priority_player(chooser);
+        return Ok(StepExecOutcome::Paused {
+            prompt_id: next_pid,
+            chooser,
+        });
+    }
+    finish_multi_dest_search(state, step, searched_player, moved_ids, shuffle_library)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn advance_multi_dest_search(
+    state: &mut GameState,
+    step: &EffectStep,
+    chooser: PlayerId,
+    searched_player: PlayerId,
+    candidates: Vec<ObjectId>,
+    destinations: Vec<SearchDestination>,
+    dest_idx: usize,
+    mut moved_ids: Vec<ObjectId>,
+    shuffle_library: bool,
+    reveal: bool,
+    picked_id: ObjectId,
+) -> Result<StepExecOutcome, EngineError> {
+    let dest_spec = destinations
+        .get(dest_idx)
+        .or_else(|| destinations.first())
+        .cloned()
+        .unwrap_or(SearchDestination {
+            zone: Zone::Hand,
+            tapped: false,
+            on_top: false,
+        });
+    let different_names = matches!(
+        &step.op,
+        mtg_ir::EffectOp::Search { spec, .. } if spec.different_names
+    );
+    let picked_name = if different_names {
+        state
+            .object(picked_id)
+            .and_then(|o| state.db().get(o.card_def))
+            .map(|c| c.name.clone())
+    } else {
+        None
+    };
+    let mut rem_candidates: Vec<ObjectId> = candidates
+        .into_iter()
+        .filter(|&cid| {
+            if cid == picked_id {
+                return false;
+            }
+            if let Some(ref pname) = picked_name {
+                let cname = state
+                    .object(cid)
+                    .and_then(|o| state.db().get(o.card_def))
+                    .map(|c| c.name.as_str());
+                if cname == Some(pname.as_str()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    if reveal {
+        zones::reveal_to_all(state, picked_id);
+    }
+    let pos = if dest_spec.on_top {
+        ZonePosition::Top
+    } else {
+        ZonePosition::Default
+    };
+    let opts = move_opts_for_zone(dest_spec.zone, dest_spec.tapped, Some(chooser), pos);
+    match zones::move_object(state, picked_id, dest_spec.zone, opts, None)? {
+        MoveObjectOutcome::Moved(raw) => {
+            let final_id = raw.new_id.unwrap_or(raw.old_id);
+            moved_ids.push(final_id);
+            append_step_binding(state, step.bind_as.as_deref(), final_id, raw.lki);
+        }
+        MoveObjectOutcome::Paused {
+            prompt_id,
+            chooser: rep_chooser,
+        } => {
+            rem_candidates.retain(|&id| state.object(id).is_some());
+            if let Some(vm) = state.resolution_vms_mut().last_mut() {
+                vm.pending_continuation = Some(Box::new(PendingStepContinuation {
+                    search_moved_ids: moved_ids,
+                    search_destinations: destinations,
+                    search_dest_idx: dest_idx,
+                    search_different_names: different_names,
+                    search_candidates: rem_candidates,
+                    search_searched_player: Some(searched_player),
+                    search_chooser: Some(chooser),
+                    search_shuffle: shuffle_library,
+                    search_reveal: reveal,
+                    search_tapped: false,
+                    ..Default::default()
+                }));
+            }
+            set_waiting_on_replacement(state, prompt_id, vec![picked_id], 0, OP_TAG_SEARCH);
+            return Ok(StepExecOutcome::Paused {
+                prompt_id,
+                chooser: rep_chooser,
+            });
+        }
+        MoveObjectOutcome::ExecuteInstead { object, steps, .. } => {
+            if let Some(vm) = state.resolution_vms_mut().last_mut() {
+                vm.subframes.push(ControlFlowFrame::SubSteps {
+                    steps,
+                    step_pc: 0,
+                    event_object: Some(object),
+                    event_player: None,
+                    event_amount: None,
+                });
+            }
+            return Ok(StepExecOutcome::EnterSubframe);
+        }
+        MoveObjectOutcome::Skipped { .. } => {}
+    }
+
+    continue_or_finish_multi_dest_search(
+        state,
+        step,
+        chooser,
+        searched_player,
+        rem_candidates,
+        destinations,
+        dest_idx + 1,
+        moved_ids,
+        shuffle_library,
+        reveal,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1047,6 +1280,46 @@ pub(crate) fn exec_dig(
         }
     }
 
+    if !spec.partitions.is_empty() {
+        if revealed.len() == 1 {
+            let only_id = revealed[0];
+            return finalize_dig_partitions(state, step, player, spec, revealed, vec![only_id]);
+        }
+        let prompt_id = state.allocate_prompt_id();
+        if let Some(vm) = state.resolution_vms_mut().last_mut() {
+            vm.pause_state = Some(StepPauseState::DigPick {
+                player,
+                revealed: revealed.clone(),
+                candidates: revealed.clone(),
+                selected: Vec::new(),
+                min: 1,
+                max: 1,
+                partition_picks: Vec::new(),
+            });
+        }
+        if let Some(fr) = state.resolution_frames_mut().last_mut() {
+            fr.pending_prompt_id = Some(prompt_id);
+        }
+        let req = ChoiceRequest::ChooseObjects {
+            prompt_id,
+            candidates: revealed,
+            min: 1,
+            max: 1,
+        };
+        state.set_pending_prompt(Some(PendingPromptContext {
+            prompt_id,
+            chooser: player,
+            request: req.clone(),
+            owner: PromptOwner::ResolutionFrame,
+        }));
+        state.set_decision(DecisionState::Prompt { request: req });
+        state.set_priority_player(player);
+        return Ok(StepExecOutcome::Paused {
+            prompt_id,
+            chooser: player,
+        });
+    }
+
     let candidates: Vec<ObjectId> = if let Some(kf) = spec.keep_filter.as_deref() {
         with_vm_eval(state, |ctx, _| {
             revealed
@@ -1079,6 +1352,7 @@ pub(crate) fn exec_dig(
             selected: Vec::new(),
             min,
             max,
+            partition_picks: Vec::new(),
         });
     }
     if let Some(fr) = state.resolution_frames_mut().last_mut() {
@@ -1104,6 +1378,119 @@ pub(crate) fn exec_dig(
     })
 }
 
+pub(crate) fn advance_dig_partitions(
+    state: &mut GameState,
+    step: &EffectStep,
+    player: PlayerId,
+    spec: &DigSpec,
+    revealed: Vec<ObjectId>,
+    mut partition_picks: Vec<ObjectId>,
+    picked_id: ObjectId,
+) -> Result<StepExecOutcome, EngineError> {
+    partition_picks.push(picked_id);
+    let rem: Vec<ObjectId> = revealed
+        .iter()
+        .copied()
+        .filter(|id| !partition_picks.contains(id))
+        .collect();
+    let has_second_non_bottom = spec
+        .partitions
+        .iter()
+        .any(|p| !p.to_hand && p.to != DigRestTo::LibraryBottom);
+    if partition_picks.len() == 1 && rem.len() >= 2 && has_second_non_bottom {
+        let next_pid = state.allocate_prompt_id();
+        if let Some(vm) = state.resolution_vms_mut().last_mut() {
+            vm.pause_state = Some(StepPauseState::DigPick {
+                player,
+                revealed,
+                candidates: rem.clone(),
+                selected: Vec::new(),
+                min: 1,
+                max: 1,
+                partition_picks,
+            });
+        }
+        if let Some(fr) = state.resolution_frames_mut().last_mut() {
+            fr.pending_prompt_id = Some(next_pid);
+        }
+        let req = ChoiceRequest::ChooseObjects {
+            prompt_id: next_pid,
+            candidates: rem,
+            min: 1,
+            max: 1,
+        };
+        state.set_pending_prompt(Some(PendingPromptContext {
+            prompt_id: next_pid,
+            chooser: player,
+            request: req.clone(),
+            owner: PromptOwner::ResolutionFrame,
+        }));
+        state.set_decision(DecisionState::Prompt { request: req });
+        state.set_priority_player(player);
+        return Ok(StepExecOutcome::Paused {
+            prompt_id: next_pid,
+            chooser: player,
+        });
+    }
+    finalize_dig_partitions(state, step, player, spec, revealed, partition_picks)
+}
+
+pub(crate) fn finalize_dig_partitions(
+    state: &mut GameState,
+    step: &EffectStep,
+    player: PlayerId,
+    spec: &DigSpec,
+    revealed: Vec<ObjectId>,
+    partition_picks: Vec<ObjectId>,
+) -> Result<StepExecOutcome, EngineError> {
+    let hand_part = spec.partitions.iter().find(|p| p.to_hand);
+    let second_part = spec
+        .partitions
+        .iter()
+        .find(|p| !p.to_hand && p.to != DigRestTo::LibraryBottom);
+
+    let hand_id = if hand_part.is_some() {
+        partition_picks.first().copied()
+    } else {
+        None
+    };
+    let second_id = if second_part.is_some() {
+        if hand_part.is_some() {
+            partition_picks
+                .get(1)
+                .copied()
+                .or_else(|| revealed.iter().copied().find(|id| Some(*id) != hand_id))
+        } else {
+            partition_picks.first().copied()
+        }
+    } else {
+        None
+    };
+    let bottom_ids: Vec<ObjectId> = revealed
+        .iter()
+        .copied()
+        .filter(|&id| Some(id) != hand_id && Some(id) != second_id)
+        .collect();
+
+    let mut batch = Vec::new();
+    let mut roles = SmallVec::<[DigMoveRole; 8]>::new();
+    if let Some(hid) = hand_id {
+        batch.push(hid);
+        roles.push(DigMoveRole::PartitionHand);
+    }
+    if let (Some(sid), Some(_)) = (second_id, second_part) {
+        batch.push(sid);
+        roles.push(DigMoveRole::PartitionSecond);
+    }
+    for bid in bottom_ids {
+        batch.push(bid);
+        roles.push(DigMoveRole::PartitionBottom);
+    }
+
+    record_step_bindings(state, step.bind_as.as_deref(), &[]);
+    run_dig_move_batch_from(state, step, player, spec, &batch, &roles, 0)
+}
+
 pub(crate) fn finalize_dig_picks(
     state: &mut GameState,
     step: &EffectStep,
@@ -1114,69 +1501,238 @@ pub(crate) fn finalize_dig_picks(
     let EffectOpRef::Dig(spec) = EffectOpRef::from_step(step) else {
         return Ok(StepExecOutcome::Done);
     };
-    let mut kept_bound = Vec::new();
+    let mut batch = Vec::new();
+    let mut roles = SmallVec::<[DigMoveRole; 8]>::new();
     for &id in &selected {
-        if spec.reveal_kept {
-            zones::reveal_to_all(state, id);
-        }
-        let (dest, pos) = match spec.keep_to {
-            DigKeepTo::LibraryTop => (Zone::Library, ZonePosition::Top),
-            DigKeepTo::Hand => (Zone::Hand, ZonePosition::Default),
-            DigKeepTo::Battlefield => (Zone::Battlefield, ZonePosition::Default),
-            DigKeepTo::Graveyard => (Zone::Graveyard, ZonePosition::Default),
-            DigKeepTo::Exile | DigKeepTo::CastFree => (Zone::Exile, ZonePosition::Default),
-        };
-        let opts = move_opts_for_zone(dest, spec.keep_tapped, Some(player), pos);
-        let mv = zones::move_object(state, id, dest, opts, None)?;
-        if let MoveObjectOutcome::Moved(raw) = mv {
-            let final_id = raw.new_id.unwrap_or(raw.old_id);
-            if let Some(pfe) = &spec.play_from_exile
-                && dest == Zone::Exile
-            {
-                let cur_turn = state.turn_number();
-                if let Some(r) = state.rare_or_default(final_id) {
-                    let exp = match pfe.duration {
-                        PlayFromExileDuration::ThisTurn => Some(cur_turn),
-                        PlayFromExileDuration::UntilEndOfYourNextTurn
-                        | PlayFromExileDuration::UntilYourNextEndStep => Some(cur_turn + 1),
-                        PlayFromExileDuration::AsLongAsExiled => None,
-                    };
-                    r.playable_from_exile_by = Some(PlayableFromExileState {
-                        player,
-                        expires_turn: exp,
-                        cast_with_mana_cost: pfe.alternative_mana_cost.clone(),
-                    });
-                }
-                state.mark_dirty(DirtyMask::EXILE | DirtyMask::PLAYER_STATE);
-            }
-            kept_bound.push((final_id, raw.lki));
-        }
+        batch.push(id);
+        roles.push(DigMoveRole::PickKept);
+    }
+    for id in revealed.into_iter().filter(|id| !selected.contains(id)) {
+        batch.push(id);
+        roles.push(DigMoveRole::PickRest);
     }
 
-    let rest_ids: Vec<ObjectId> = revealed
-        .into_iter()
-        .filter(|id| !selected.contains(id))
-        .collect();
-    let rest_dest = if spec.rest_to_hand {
-        (Zone::Hand, ZonePosition::Default)
-    } else {
-        match spec.rest {
-            DigRestTo::LibraryBottom => (Zone::Library, ZonePosition::Bottom),
-            DigRestTo::LibraryTop => (Zone::Library, ZonePosition::Top),
-            DigRestTo::Graveyard => (Zone::Graveyard, ZonePosition::Default),
-            DigRestTo::Exile => (Zone::Exile, ZonePosition::Default),
+    record_step_bindings(state, step.bind_as.as_deref(), &[]);
+    run_dig_move_batch_from(state, step, player, spec, &batch, &roles, 0)
+}
+
+fn dig_move_params(spec: &DigSpec, role: DigMoveRole) -> (Zone, ZonePosition, bool, bool) {
+    match role {
+        DigMoveRole::PartitionHand => (Zone::Hand, ZonePosition::Default, false, spec.reveal_kept),
+        DigMoveRole::PartitionSecond => {
+            let second_part = spec
+                .partitions
+                .iter()
+                .find(|p| !p.to_hand && p.to != DigRestTo::LibraryBottom);
+            let (dest, pos) = match second_part.map(|p| p.to) {
+                Some(DigRestTo::Exile) => (Zone::Exile, ZonePosition::Default),
+                Some(DigRestTo::Graveyard) => (Zone::Graveyard, ZonePosition::Default),
+                Some(DigRestTo::LibraryTop) => (Zone::Library, ZonePosition::Top),
+                Some(DigRestTo::LibraryBottom) | None => (Zone::Library, ZonePosition::Bottom),
+            };
+            (dest, pos, false, false)
         }
-    };
-    for id in rest_ids {
-        let opts = move_opts_for_zone(rest_dest.0, false, Some(player), rest_dest.1);
-        let _ = zones::move_object(state, id, rest_dest.0, opts, None)?;
+        DigMoveRole::PartitionBottom => (Zone::Library, ZonePosition::Bottom, false, false),
+        DigMoveRole::PickKept => {
+            let (dest, pos) = match spec.keep_to {
+                DigKeepTo::LibraryTop => (Zone::Library, ZonePosition::Top),
+                DigKeepTo::Hand => (Zone::Hand, ZonePosition::Default),
+                DigKeepTo::Battlefield => (Zone::Battlefield, ZonePosition::Default),
+                DigKeepTo::Graveyard => (Zone::Graveyard, ZonePosition::Default),
+                DigKeepTo::Exile | DigKeepTo::CastFree => (Zone::Exile, ZonePosition::Default),
+            };
+            (dest, pos, spec.keep_tapped, spec.reveal_kept)
+        }
+        DigMoveRole::PickRest => {
+            let (dest, pos) = if spec.rest_to_hand {
+                (Zone::Hand, ZonePosition::Default)
+            } else {
+                match spec.rest {
+                    DigRestTo::LibraryBottom => (Zone::Library, ZonePosition::Bottom),
+                    DigRestTo::LibraryTop => (Zone::Library, ZonePosition::Top),
+                    DigRestTo::Graveyard => (Zone::Graveyard, ZonePosition::Default),
+                    DigRestTo::Exile => (Zone::Exile, ZonePosition::Default),
+                }
+            };
+            (dest, pos, false, false)
+        }
     }
-    if spec.shuffle_rest {
+}
+
+fn run_dig_move_batch_from(
+    state: &mut GameState,
+    step: &EffectStep,
+    player: PlayerId,
+    spec: &DigSpec,
+    batch: &[ObjectId],
+    roles: &[DigMoveRole],
+    start_idx: usize,
+) -> Result<StepExecOutcome, EngineError> {
+    for (off, &id) in batch.get(start_idx..).unwrap_or(&[]).iter().enumerate() {
+        let idx = start_idx + off;
+        let Some(&role) = roles.get(idx) else {
+            break;
+        };
+        let (dest, pos, tapped, reveal_before) = dig_move_params(spec, role);
+        if reveal_before {
+            zones::reveal_to_all(state, id);
+        }
+        let opts = move_opts_for_zone(dest, tapped, Some(player), pos);
+        let mv = zones::move_object(state, id, dest, opts, None)?;
+        let out = apply_dig_move_outcome(state, step, player, spec, role, mv, batch, roles, idx)?;
+        if !matches!(out, StepExecOutcome::Done) {
+            return Ok(out);
+        }
+    }
+    if spec.partitions.is_empty() && spec.shuffle_rest {
         zones::shuffle_library(state, player, 0)?;
         emit_event(state, AtomicEventKind::LibraryShuffled { player });
     }
-    record_step_bindings(state, step.bind_as.as_deref(), &kept_bound);
+    if let Some(vm) = state.resolution_vms_mut().last_mut() {
+        vm.pending_continuation = None;
+    }
     Ok(StepExecOutcome::Done)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_dig_move_outcome(
+    state: &mut GameState,
+    step: &EffectStep,
+    player: PlayerId,
+    spec: &DigSpec,
+    role: DigMoveRole,
+    mv: MoveObjectOutcome,
+    batch: &[ObjectId],
+    roles: &[DigMoveRole],
+    idx: usize,
+) -> Result<StepExecOutcome, EngineError> {
+    match mv {
+        MoveObjectOutcome::Moved(raw) => {
+            let final_id = raw.new_id.unwrap_or(raw.old_id);
+            match role {
+                DigMoveRole::PartitionSecond => {
+                    let second_part = spec
+                        .partitions
+                        .iter()
+                        .find(|p| !p.to_hand && p.to != DigRestTo::LibraryBottom);
+                    if second_part.is_some_and(|sp| sp.playable_this_turn)
+                        && !raw.ceased_to_exist
+                        && raw.to_zone == Zone::Exile
+                    {
+                        let cur_turn = state.turn_number();
+                        if let Some(r) = state.rare_or_default(final_id) {
+                            r.playable_from_exile_by = Some(PlayableFromExileState {
+                                player,
+                                expires_turn: Some(cur_turn),
+                                cast_with_mana_cost: None,
+                            });
+                            state.mark_dirty(DirtyMask::EXILE | DirtyMask::PLAYER_STATE);
+                        }
+                    }
+                    append_step_binding(state, step.bind_as.as_deref(), final_id, raw.lki);
+                }
+                DigMoveRole::PickKept => {
+                    if let Some(pfe) = &spec.play_from_exile
+                        && !raw.ceased_to_exist
+                        && raw.to_zone == Zone::Exile
+                    {
+                        let cur_turn = state.turn_number();
+                        if let Some(r) = state.rare_or_default(final_id) {
+                            let exp = match pfe.duration {
+                                PlayFromExileDuration::ThisTurn => Some(cur_turn),
+                                PlayFromExileDuration::UntilEndOfYourNextTurn
+                                | PlayFromExileDuration::UntilYourNextEndStep => Some(cur_turn + 1),
+                                PlayFromExileDuration::AsLongAsExiled => None,
+                            };
+                            r.playable_from_exile_by = Some(PlayableFromExileState {
+                                player,
+                                expires_turn: exp,
+                                cast_with_mana_cost: pfe.alternative_mana_cost.clone(),
+                            });
+                        }
+                        state.mark_dirty(DirtyMask::EXILE | DirtyMask::PLAYER_STATE);
+                    }
+                    append_step_binding(state, step.bind_as.as_deref(), final_id, raw.lki);
+                }
+                DigMoveRole::PartitionHand => {
+                    append_step_binding(state, step.bind_as.as_deref(), final_id, raw.lki);
+                }
+                DigMoveRole::PartitionBottom | DigMoveRole::PickRest => {}
+            }
+            Ok(StepExecOutcome::Done)
+        }
+        MoveObjectOutcome::Skipped { .. } => Ok(StepExecOutcome::Done),
+        MoveObjectOutcome::Paused { prompt_id, chooser } => {
+            if let Some(vm) = state.resolution_vms_mut().last_mut() {
+                vm.pending_continuation = Some(Box::new(PendingStepContinuation {
+                    dig_player: Some(player),
+                    dig_roles: roles.iter().copied().collect(),
+                    ..Default::default()
+                }));
+            }
+            set_waiting_on_replacement(state, prompt_id, batch.to_vec(), idx, OP_TAG_DIG);
+            Ok(StepExecOutcome::Paused { prompt_id, chooser })
+        }
+        MoveObjectOutcome::ExecuteInstead { object, steps, .. } => {
+            if let Some(vm) = state.resolution_vms_mut().last_mut() {
+                vm.subframes.push(ControlFlowFrame::SubSteps {
+                    steps,
+                    step_pc: 0,
+                    event_object: Some(object),
+                    event_player: None,
+                    event_amount: None,
+                });
+            }
+            Ok(StepExecOutcome::EnterSubframe)
+        }
+    }
+}
+
+pub(crate) fn resume_dig_after_replacement(
+    state: &mut GameState,
+    step: &EffectStep,
+    mv: MoveObjectOutcome,
+    batch_remaining: &[ObjectId],
+    batch_idx: usize,
+) -> Result<StepExecOutcome, EngineError> {
+    let cont = state
+        .resolution_vms_mut()
+        .last_mut()
+        .and_then(|vm| vm.pending_continuation.take())
+        .unwrap_or_default();
+    let player = cont
+        .dig_player
+        .unwrap_or_else(|| resolve_step_actor(state, step));
+    let roles = cont.dig_roles;
+    let EffectOpRef::Dig(spec) = EffectOpRef::from_step(step) else {
+        return Ok(StepExecOutcome::Done);
+    };
+    let Some(&role) = roles.get(batch_idx) else {
+        return Ok(StepExecOutcome::Done);
+    };
+    let res = apply_dig_move_outcome(
+        state,
+        step,
+        player,
+        spec,
+        role,
+        mv,
+        batch_remaining,
+        &roles,
+        batch_idx,
+    )?;
+    if !matches!(res, StepExecOutcome::Done) {
+        return Ok(res);
+    }
+    run_dig_move_batch_from(
+        state,
+        step,
+        player,
+        spec,
+        batch_remaining,
+        &roles,
+        batch_idx + 1,
+    )
 }
 
 enum EffectOpRef<'a> {

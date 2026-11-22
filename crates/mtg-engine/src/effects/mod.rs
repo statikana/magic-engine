@@ -23,7 +23,7 @@ use crate::state::{
 
 use self::vm::{
     OP_TAG_BOUNCE, OP_TAG_CREATE_TOKEN, OP_TAG_DAMAGE, OP_TAG_DRAW, OP_TAG_GAIN_LIFE,
-    OP_TAG_MONSTROUS, OP_TAG_MOVE, OP_TAG_PROLIFERATE, OP_TAG_PROLIFERATE_COUNTER,
+    OP_TAG_MONSTROUS, OP_TAG_PROLIFERATE, OP_TAG_PROLIFERATE_COUNTER,
     OP_TAG_PROLIFERATE_PLAYER_COUNTER, OP_TAG_PUT_COUNTERS, OP_TAG_PUT_PLAYER_COUNTERS,
     OP_TAG_SACRIFICE, OP_TAG_TAP_OR_UNTAP, OP_TAG_UNTAP, StepExecOutcome, active_legal_actions,
     advance_active_pc, current_step_cloned, execute_single_step_with_op, finish_accepted_step,
@@ -388,6 +388,8 @@ pub fn abort_resolution_prompt_on_concede(
             | StepPauseState::DigPick { .. }
             | StepPauseState::ChooseNumber { .. }
             | StepPauseState::ChooseMode { .. }
+            | StepPauseState::MoveCountersSelectTarget { .. }
+            | StepPauseState::MoveCountersChooseAmount { .. }
             | StepPauseState::GuidedResolution { .. }
             | StepPauseState::WaitingOnReplacement { .. },
         )
@@ -1241,9 +1243,7 @@ pub(crate) fn resume_selection_op(
         EffectOp::Bounce { .. } => {
             zones_tokens::resume_zone_move_batch(state, step, &selected, 0, OP_TAG_BOUNCE)
         }
-        EffectOp::Move { .. } => {
-            zones_tokens::resume_zone_move_batch(state, step, &selected, 0, OP_TAG_MOVE)
-        }
+        EffectOp::Move { .. } => zones_tokens::run_move_targets(state, step, selected),
         EffectOp::Sacrifice { .. } => {
             zones_tokens::resume_zone_move_batch(state, step, &selected, 0, OP_TAG_SACRIFICE)
         }
@@ -6564,5 +6564,2848 @@ mod tests {
         assert!(ev.types.contains(CardTypeMask::CREATURE));
         assert!(ev.subtypes.contains(&mtg_ir::SubtypeId(0)));
         assert_eq!(ev.colors, ColorMask::R);
+    }
+
+    #[test]
+    fn synth_move_hand_to_library_top_uses_step_amount_and_preserves_top_order() {
+        let mut state = synth_db_and_state(false);
+        let old_hand = state.player(PlayerId(0)).unwrap().hand.clone();
+        for id in old_hand {
+            crate::zones::move_object_raw(
+                &mut state,
+                id,
+                Zone::Library,
+                crate::zones::MoveRawOptions::default(),
+                None,
+            )
+            .unwrap();
+        }
+        let mut hand_ids = Vec::new();
+        for _ in 0..4 {
+            let ts = state.allocate_timestamp();
+            let id = state.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    PlayerId(0),
+                    Zone::Hand,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().hand.push(id);
+            hand_ids.push(id);
+        }
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let mut mv_step = make_step(EffectOp::Move {
+            from: Some(Zone::Hand),
+            to: Some(Zone::Library),
+            select: mtg_ir::SelectionMod::default(),
+            tapped: false,
+            under_your_control: false,
+            topmost_only: false,
+            may_shuffle: false,
+            position: Some(mtg_ir::LibraryPosition::Top),
+            from_top: None,
+            library_choice_by: None,
+            random_order: false,
+            entered_transformed: false,
+            entered_flipped: false,
+            enters_tapped_and_attacking: false,
+            as_enchantment_only: false,
+            unearth: false,
+            with_counters: None,
+            attached_to: None,
+            condition: None,
+            choose_at_random_from_exiled_with_self: false,
+            leave_chosen_in_graveyard_rest_to_hand: false,
+            split_exiled_cost_cards_to_bottom_and_battlefield: false,
+        });
+        mv_step.subject = Selector::All {
+            filter: Box::new(ObjectFilter {
+                zones: mtg_ir::ZoneMask::HAND,
+                controller: Some(mtg_ir::RelativeControl::You),
+                ..Default::default()
+            }),
+        };
+        mv_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+
+        let out = begin_resolution_frame(
+            &mut state,
+            StackItemId(401),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![mv_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id, chooser } = out else {
+            panic!("expected ChooseObjects pause, got {out:?}");
+        };
+        assert_eq!(chooser, PlayerId(0));
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(crate::action::ChoiceRequest::ChooseObjects {
+                min,
+                max,
+                candidates,
+                ..
+            }) => {
+                assert_eq!((*min, *max, candidates.len()), (2, 2, 4));
+            }
+            other => panic!("expected ChooseObjects(min=2, max=2), got {other:?}"),
+        }
+
+        let pick_a = hand_ids[0];
+        let pick_b = hand_ids[1];
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            prompt_id,
+            ChoiceAnswer::PickObject { id: pick_a },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: prompt_id2,
+            ..
+        } = out2
+        else {
+            panic!("expected second pick pause, got {out2:?}");
+        };
+        let out3 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            prompt_id2,
+            ChoiceAnswer::PickObject { id: pick_b },
+        )
+        .unwrap();
+        assert_eq!(out3, FrameOutcome::Completed);
+
+        let p0 = state.player(PlayerId(0)).unwrap();
+        assert_eq!(p0.hand.len(), 2);
+        let lib_len = p0.library.len();
+        assert_eq!(p0.library[lib_len - 1].index, pick_a.index);
+        assert_eq!(p0.library[lib_len - 2].index, pick_b.index);
+    }
+
+    #[test]
+    fn synth_move_hand_to_library_top_pauses_when_hand_len_equals_amount() {
+        let mut state = synth_db_and_state(false);
+        let old_hand = state.player(PlayerId(0)).unwrap().hand.clone();
+        for id in old_hand {
+            crate::zones::move_object_raw(
+                &mut state,
+                id,
+                Zone::Library,
+                crate::zones::MoveRawOptions::default(),
+                None,
+            )
+            .unwrap();
+        }
+        let mut hand_ids = Vec::new();
+        for _ in 0..2 {
+            let ts = state.allocate_timestamp();
+            let id = state.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    PlayerId(0),
+                    Zone::Hand,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().hand.push(id);
+            hand_ids.push(id);
+        }
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let mut mv_step = make_step(EffectOp::Move {
+            from: Some(Zone::Hand),
+            to: Some(Zone::Library),
+            select: mtg_ir::SelectionMod::default(),
+            tapped: false,
+            under_your_control: false,
+            topmost_only: false,
+            may_shuffle: false,
+            position: Some(mtg_ir::LibraryPosition::Top),
+            from_top: None,
+            library_choice_by: None,
+            random_order: false,
+            entered_transformed: false,
+            entered_flipped: false,
+            enters_tapped_and_attacking: false,
+            as_enchantment_only: false,
+            unearth: false,
+            with_counters: None,
+            attached_to: None,
+            condition: None,
+            choose_at_random_from_exiled_with_self: false,
+            leave_chosen_in_graveyard_rest_to_hand: false,
+            split_exiled_cost_cards_to_bottom_and_battlefield: false,
+        });
+        mv_step.subject = Selector::All {
+            filter: Box::new(ObjectFilter {
+                zones: mtg_ir::ZoneMask::HAND,
+                controller: Some(mtg_ir::RelativeControl::You),
+                ..Default::default()
+            }),
+        };
+        mv_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+
+        let out = begin_resolution_frame(
+            &mut state,
+            StackItemId(402),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![mv_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id, chooser } = out else {
+            panic!("expected ChooseObjects pause when hand len == amount == 2, got {out:?}");
+        };
+        assert_eq!(chooser, PlayerId(0));
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(crate::action::ChoiceRequest::ChooseObjects {
+                min,
+                max,
+                candidates,
+                ..
+            }) => {
+                assert_eq!((*min, *max, candidates.len()), (2, 2, 2));
+            }
+            other => panic!("expected ChooseObjects(min=2, max=2), got {other:?}"),
+        }
+
+        let pick_first = hand_ids[1];
+        let pick_second = hand_ids[0];
+        let FrameOutcome::Paused {
+            prompt_id: prompt_id2,
+            ..
+        } = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            prompt_id,
+            ChoiceAnswer::PickObject { id: pick_first },
+        )
+        .unwrap()
+        else {
+            panic!("expected second pick pause");
+        };
+        let out3 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            prompt_id2,
+            ChoiceAnswer::PickObject { id: pick_second },
+        )
+        .unwrap();
+        assert_eq!(out3, FrameOutcome::Completed);
+
+        let p0 = state.player(PlayerId(0)).unwrap();
+        assert!(p0.hand.is_empty());
+        let lib_len = p0.library.len();
+        assert_eq!(p0.library[lib_len - 1].index, pick_first.index);
+        assert_eq!(p0.library[lib_len - 2].index, pick_second.index);
+    }
+
+    #[test]
+    fn synth_move_hand_to_battlefield_up_to_uses_step_amount() {
+        let mut state = synth_db_and_state(false);
+        let old_hand = state.player(PlayerId(0)).unwrap().hand.clone();
+        for id in old_hand {
+            crate::zones::move_object_raw(
+                &mut state,
+                id,
+                Zone::Library,
+                crate::zones::MoveRawOptions::default(),
+                None,
+            )
+            .unwrap();
+        }
+        let mut hand_ids = Vec::new();
+        for _ in 0..3 {
+            let ts = state.allocate_timestamp();
+            let id = state.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    PlayerId(0),
+                    Zone::Hand,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().hand.push(id);
+            hand_ids.push(id);
+        }
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let mut mv_step = make_step(EffectOp::Move {
+            from: Some(Zone::Hand),
+            to: Some(Zone::Battlefield),
+            select: mtg_ir::SelectionMod {
+                up_to: true,
+                choice_count: None,
+                ..Default::default()
+            },
+            tapped: false,
+            under_your_control: false,
+            topmost_only: false,
+            may_shuffle: false,
+            position: None,
+            from_top: None,
+            library_choice_by: None,
+            random_order: false,
+            entered_transformed: false,
+            entered_flipped: false,
+            enters_tapped_and_attacking: false,
+            as_enchantment_only: false,
+            unearth: false,
+            with_counters: None,
+            attached_to: None,
+            condition: None,
+            choose_at_random_from_exiled_with_self: false,
+            leave_chosen_in_graveyard_rest_to_hand: false,
+            split_exiled_cost_cards_to_bottom_and_battlefield: false,
+        });
+        mv_step.subject = Selector::All {
+            filter: Box::new(ObjectFilter {
+                zones: mtg_ir::ZoneMask::HAND,
+                types_any: CardTypeMask::LAND,
+                controller: Some(mtg_ir::RelativeControl::You),
+                ..Default::default()
+            }),
+        };
+        mv_step.amount = Some(Box::new(Amount::Const { n: 1 }));
+
+        let out = begin_resolution_frame(
+            &mut state,
+            StackItemId(403),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![mv_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id, chooser } = out else {
+            panic!("expected ChooseObjects pause, got {out:?}");
+        };
+        assert_eq!(chooser, PlayerId(0));
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(crate::action::ChoiceRequest::ChooseObjects {
+                min,
+                max,
+                candidates,
+                ..
+            }) => {
+                assert_eq!((*min, *max, candidates.len()), (0, 1, 3));
+            }
+            other => panic!("expected ChooseObjects(min=0, max=1), got {other:?}"),
+        }
+
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            prompt_id,
+            ChoiceAnswer::PickObject { id: hand_ids[0] },
+        )
+        .unwrap();
+        assert_eq!(out2, FrameOutcome::Completed);
+
+        let p0 = state.player(PlayerId(0)).unwrap();
+        assert_eq!(p0.hand.len(), 2);
+        assert_eq!(p0.battlefield.len(), 1);
+    }
+
+    #[test]
+    fn synth_dig_partitions_three_two_one_cards_and_postcard_roundtrip() {
+        let mut tables = InternTables::default();
+        tables.keywords.push("flying".into());
+        let card = synth_card_def(
+            "synth_dig_land",
+            "Synth Dig Land",
+            ColorMask::empty(),
+            CardTypeMask::LAND,
+            SmallVec::new(),
+            None,
+            vec![],
+        );
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![card],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 10],
+            sideboard: vec![],
+        };
+
+        let make_partition_dig = || {
+            make_step(EffectOp::Dig {
+                spec: Box::new(mtg_ir::DigSpec {
+                    keep: 1,
+                    up_to: false,
+                    keep_filter: None,
+                    keep_all_matching: false,
+                    keep_label: None,
+                    keep_to: mtg_ir::DigKeepTo::Hand,
+                    keep_tapped: false,
+                    keep_attacking: false,
+                    keep_attacking_player: None,
+                    reveal_all: false,
+                    reveal_kept: false,
+                    rest: mtg_ir::DigRestTo::LibraryBottom,
+                    rest_random: false,
+                    rest_order: None,
+                    until_filter: None,
+                    rest_to_hand: false,
+                    shuffle_rest: false,
+                    keep_max_mana_value: None,
+                    keep_max_mv_strict_lt: false,
+                    choose_one_of_exiled: false,
+                    play_from_exile: None,
+                    partitions: vec![
+                        mtg_ir::DigPartition {
+                            count: 1,
+                            to: mtg_ir::DigRestTo::LibraryBottom,
+                            to_hand: true,
+                            playable_this_turn: false,
+                        },
+                        mtg_ir::DigPartition {
+                            count: 1,
+                            to: mtg_ir::DigRestTo::LibraryBottom,
+                            to_hand: false,
+                            playable_this_turn: false,
+                        },
+                        mtg_ir::DigPartition {
+                            count: 1,
+                            to: mtg_ir::DigRestTo::Exile,
+                            to_hand: false,
+                            playable_this_turn: true,
+                        },
+                    ],
+                    destination_buckets: vec![],
+                }),
+                look_only: true,
+            })
+        };
+        let mut dig_step = make_partition_dig();
+        dig_step.amount = Some(Box::new(Amount::Const { n: 3 }));
+
+        // Case A: 3 cards -> 2 prompts + postcard snapshot roundtrip mid-DigPick
+        let mut state = GameState::new(
+            Arc::clone(&db),
+            GameConfig::standard_1v1(),
+            &[deck.clone(), deck.clone()],
+            101,
+        )
+        .unwrap();
+        let top0 = *state.player(PlayerId(0)).unwrap().library.last().unwrap();
+        let lib = &state.player(PlayerId(0)).unwrap().library;
+        let top1 = lib[lib.len() - 2];
+        let top2 = lib[lib.len() - 3];
+        let hand_before = state.player(PlayerId(0)).unwrap().hand.len();
+
+        let out1 = begin_resolution_frame(
+            &mut state,
+            StackItemId(501),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![dig_step.clone()],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: pid1,
+            chooser: c1,
+        } = out1
+        else {
+            panic!("expected first DigPick prompt, got {out1:?}");
+        };
+        assert_eq!(c1, PlayerId(0));
+
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            pid1,
+            ChoiceAnswer::PickObject { id: top0 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: pid2,
+            chooser: c2,
+        } = out2
+        else {
+            panic!("expected second DigPick prompt, got {out2:?}");
+        };
+        assert_eq!(c2, PlayerId(0));
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(ChoiceRequest::ChooseObjects {
+                candidates,
+                min,
+                max,
+                ..
+            }) => {
+                assert_eq!((*min, *max), (1, 1));
+                assert_eq!(candidates, &vec![top1, top2]);
+            }
+            other => panic!("expected second ChooseObjects(1..=1), got {other:?}"),
+        }
+
+        // Postcard round-trip via GameStateSnapshot while paused with partition_picks populated.
+        let bytes = postcard::to_allocvec(&state.to_snapshot()).unwrap();
+        let snap: crate::state::GameStateSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let mut restored = GameState::from_snapshot(Arc::clone(&db), snap);
+
+        let out3 = resume_resolution_frame(
+            &mut restored,
+            PlayerId(0),
+            pid2,
+            ChoiceAnswer::PickObject { id: top1 },
+        )
+        .unwrap();
+        assert_eq!(out3, FrameOutcome::Completed);
+
+        let p0 = restored.player(PlayerId(0)).unwrap();
+        assert_eq!(p0.hand.len(), hand_before + 1);
+        assert_eq!(p0.exile.len(), 1);
+        let exiled_id = p0.exile[0];
+        let pfe = restored
+            .rare(exiled_id)
+            .and_then(|r| r.playable_from_exile_by.as_ref())
+            .expect("exiled partition should be playable this turn");
+        assert_eq!(pfe.player, PlayerId(0));
+        assert_eq!(pfe.expires_turn, Some(restored.turn_number()));
+        assert_eq!(p0.library.len(), 1); // 1 card bottomed from the 3-card dig
+
+        // Case B: 2 cards in library -> 1 prompt (hand + playable exile, 0 bottom)
+        let mut state2 = GameState::new(
+            Arc::clone(&db),
+            GameConfig::standard_1v1(),
+            &[deck.clone(), deck.clone()],
+            102,
+        )
+        .unwrap();
+        let p0_lib_len = state2.player(PlayerId(0)).unwrap().library.len();
+        for _ in 0..(p0_lib_len - 2) {
+            let id = state2
+                .player_mut(PlayerId(0))
+                .unwrap()
+                .library
+                .pop()
+                .unwrap();
+            state2.player_mut(PlayerId(0)).unwrap().hand.push(id);
+            state2.object_mut(id).unwrap().zone = Zone::Hand;
+        }
+        let two_top = *state2.player(PlayerId(0)).unwrap().library.last().unwrap();
+        let hand_before2 = state2.player(PlayerId(0)).unwrap().hand.len();
+        let out_b1 = begin_resolution_frame(
+            &mut state2,
+            StackItemId(502),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![dig_step.clone()],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: pid_b, ..
+        } = out_b1
+        else {
+            panic!("expected 1 prompt for 2 cards, got {out_b1:?}");
+        };
+        let out_b2 = resume_resolution_frame(
+            &mut state2,
+            PlayerId(0),
+            pid_b,
+            ChoiceAnswer::PickObject { id: two_top },
+        )
+        .unwrap();
+        assert_eq!(out_b2, FrameOutcome::Completed);
+        assert_eq!(
+            state2.player(PlayerId(0)).unwrap().hand.len(),
+            hand_before2 + 1
+        );
+        assert_eq!(state2.player(PlayerId(0)).unwrap().exile.len(), 1);
+        assert!(
+            state2
+                .rare(state2.player(PlayerId(0)).unwrap().exile[0])
+                .and_then(|r| r.playable_from_exile_by.as_ref())
+                .is_some()
+        );
+
+        // Case C: 1 card in library -> 0 prompts (straight to hand)
+        let mut state1 = GameState::new(
+            Arc::clone(&db),
+            GameConfig::standard_1v1(),
+            &[deck.clone(), deck],
+            103,
+        )
+        .unwrap();
+        let p0_lib_len1 = state1.player(PlayerId(0)).unwrap().library.len();
+        for _ in 0..(p0_lib_len1 - 1) {
+            let id = state1
+                .player_mut(PlayerId(0))
+                .unwrap()
+                .library
+                .pop()
+                .unwrap();
+            state1.player_mut(PlayerId(0)).unwrap().hand.push(id);
+            state1.object_mut(id).unwrap().zone = Zone::Hand;
+        }
+        let hand_before1 = state1.player(PlayerId(0)).unwrap().hand.len();
+        let out_c = begin_resolution_frame(
+            &mut state1,
+            StackItemId(503),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![dig_step],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(out_c, FrameOutcome::Completed);
+        assert_eq!(
+            state1.player(PlayerId(0)).unwrap().hand.len(),
+            hand_before1 + 1
+        );
+        assert!(state1.player(PlayerId(0)).unwrap().exile.is_empty());
+    }
+
+    #[test]
+    fn synth_multi_dest_search_sequential_fail_to_find_and_postcard_roundtrip() {
+        let mut state = synth_db_and_state(false);
+        let db = Arc::new(state.db().clone());
+        let search_step = make_step(EffectOp::Search {
+            spec: Box::new(mtg_ir::SearchSpec {
+                filter: Box::new(ObjectFilter {
+                    types_any: CardTypeMask::LAND,
+                    ..Default::default()
+                }),
+                count: 2,
+                up_to: true,
+                stated_quality: true,
+                destinations: vec![
+                    mtg_ir::SearchDestination {
+                        zone: Zone::Battlefield,
+                        tapped: true,
+                        on_top: false,
+                    },
+                    mtg_ir::SearchDestination {
+                        zone: Zone::Hand,
+                        tapped: false,
+                        on_top: false,
+                    },
+                ],
+                reveal: true,
+                description: None,
+                zones: mtg_ir::ZoneMask::LIBRARY,
+                different_names: false,
+                shuffle_only_if_library: false,
+                searched_player: None,
+                cast_free: false,
+                target_controller_as_actor: false,
+            }),
+            tapped: true,
+        });
+
+        let lib0 = state.player(PlayerId(0)).unwrap().library[0];
+        let lib1 = state.player(PlayerId(0)).unwrap().library[1];
+        let hand_before = state.player(PlayerId(0)).unwrap().hand.len();
+        let bf_before = state.player(PlayerId(0)).unwrap().battlefield.len();
+
+        let out1 = begin_resolution_frame(
+            &mut state,
+            StackItemId(511),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![search_step.clone()],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: pid1, ..
+        } = out1
+        else {
+            panic!("expected first SearchPick prompt, got {out1:?}");
+        };
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(ChoiceRequest::ChooseObjects { min, max, .. }) => {
+                assert_eq!((*min, *max), (0, 1));
+            }
+            other => panic!("expected ChooseObjects(min=0, max=1), got {other:?}"),
+        }
+
+        // Pick first land -> immediately moves tapped to battlefield, opens prompt 2.
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            pid1,
+            ChoiceAnswer::PickObject { id: lib0 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: pid2, ..
+        } = out2
+        else {
+            panic!("expected second SearchPick prompt, got {out2:?}");
+        };
+        assert_eq!(
+            state.player(PlayerId(0)).unwrap().battlefield.len(),
+            bf_before + 1
+        );
+        let bf_id = *state
+            .player(PlayerId(0))
+            .unwrap()
+            .battlefield
+            .last()
+            .unwrap();
+        assert!(
+            state
+                .object(bf_id)
+                .unwrap()
+                .flags
+                .contains(crate::state::ObjectFlags::TAPPED)
+        );
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(ChoiceRequest::ChooseObjects {
+                candidates,
+                min,
+                max,
+                ..
+            }) => {
+                assert_eq!((*min, *max), (0, 1));
+                assert!(!candidates.contains(&lib0));
+                assert!(candidates.contains(&lib1));
+            }
+            other => panic!("expected second ChooseObjects(min=0, max=1), got {other:?}"),
+        }
+
+        // Postcard round-trip while paused at dest_idx == 1!
+        let bytes = postcard::to_allocvec(&state.to_snapshot()).unwrap();
+        let snap: crate::state::GameStateSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let mut restored = GameState::from_snapshot(Arc::clone(&db), snap);
+
+        let out3 = resume_resolution_frame(
+            &mut restored,
+            PlayerId(0),
+            pid2,
+            ChoiceAnswer::PickObject { id: lib1 },
+        )
+        .unwrap();
+        assert_eq!(out3, FrameOutcome::Completed);
+        assert_eq!(
+            restored.player(PlayerId(0)).unwrap().hand.len(),
+            hand_before + 1
+        );
+        assert_eq!(
+            restored.player(PlayerId(0)).unwrap().battlefield.len(),
+            bf_before + 1
+        );
+
+        // Fail to find on prompt 1 -> skips prompt 2 and finishes immediately.
+        let mut state_ftf = synth_db_and_state(false);
+        let out_ftf1 = begin_resolution_frame(
+            &mut state_ftf,
+            StackItemId(512),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![search_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: pid_f, ..
+        } = out_ftf1
+        else {
+            panic!("expected SearchPick prompt for fail-to-find");
+        };
+        let out_ftf2 = resume_resolution_frame(
+            &mut state_ftf,
+            PlayerId(0),
+            pid_f,
+            ChoiceAnswer::DonePicking,
+        )
+        .unwrap();
+        assert_eq!(out_ftf2, FrameOutcome::Completed);
+    }
+
+    #[test]
+    fn synth_move_may_shuffle_is_unconditional_while_look_and_reorder_still_prompts() {
+        let mut state = synth_db_and_state(false);
+        // Spawn a permanent owned by PlayerId(1) on the battlefield.
+        let ts = state.allocate_timestamp();
+        let perm = state.insert_object(
+            crate::state::GameObject::new(
+                CardDefId(0),
+                PlayerId(1),
+                Zone::Battlefield,
+                ts,
+                crate::state::ObjectFlags::empty(),
+            ),
+            None,
+        );
+        state
+            .player_mut(PlayerId(1))
+            .unwrap()
+            .battlefield
+            .push(perm);
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let p1_lib_before = state.player(PlayerId(1)).unwrap().library.len();
+        let mut move_step = make_step(EffectOp::Move {
+            from: None,
+            to: Some(Zone::Library),
+            select: mtg_ir::SelectionMod::default(),
+            tapped: false,
+            under_your_control: false,
+            topmost_only: false,
+            may_shuffle: true,
+            position: None,
+            from_top: None,
+            library_choice_by: None,
+            random_order: false,
+            entered_transformed: false,
+            entered_flipped: false,
+            enters_tapped_and_attacking: false,
+            as_enchantment_only: false,
+            unearth: false,
+            with_counters: None,
+            attached_to: None,
+            condition: None,
+            choose_at_random_from_exiled_with_self: false,
+            leave_chosen_in_graveyard_rest_to_hand: false,
+            split_exiled_cost_cards_to_bottom_and_battlefield: false,
+        });
+        move_step.subject = Selector::Target { index: 0 };
+
+        let ev_start = state.event_log().len();
+        let out = begin_resolution_frame(
+            &mut state,
+            StackItemId(521),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![TargetRef::Object { id: perm }],
+            vec![],
+            SmallVec::new(),
+            vec![move_step],
+            vec![],
+        )
+        .unwrap();
+        // Unconditional shuffle -> completes immediately with 0 YesNo prompts!
+        assert_eq!(out, FrameOutcome::Completed);
+        assert!(state.player(PlayerId(1)).unwrap().battlefield.is_empty());
+        assert_eq!(
+            state.player(PlayerId(1)).unwrap().library.len(),
+            p1_lib_before + 1
+        );
+        assert!(
+            state.event_log()[ev_start..].iter().any(|ev| matches!(
+                ev.kind,
+                crate::events::AtomicEventKind::LibraryShuffled {
+                    player: PlayerId(1)
+                }
+            )),
+            "expected LibraryShuffled event for owner"
+        );
+
+        // Empty Selector::All with may_shuffle: true still shuffles affected player (CR 701.20d).
+        let mut all_gy_step = make_step(EffectOp::Move {
+            from: Some(Zone::Graveyard),
+            to: Some(Zone::Library),
+            select: mtg_ir::SelectionMod::default(),
+            tapped: false,
+            under_your_control: false,
+            topmost_only: false,
+            may_shuffle: true,
+            position: None,
+            from_top: None,
+            library_choice_by: None,
+            random_order: false,
+            entered_transformed: false,
+            entered_flipped: false,
+            enters_tapped_and_attacking: false,
+            as_enchantment_only: false,
+            unearth: false,
+            with_counters: None,
+            attached_to: None,
+            condition: None,
+            choose_at_random_from_exiled_with_self: false,
+            leave_chosen_in_graveyard_rest_to_hand: false,
+            split_exiled_cost_cards_to_bottom_and_battlefield: false,
+        });
+        all_gy_step.subject = Selector::All {
+            filter: Box::new(ObjectFilter {
+                zones: mtg_ir::ZoneMask::GRAVEYARD,
+                owner: Some(mtg_ir::RelativeControl::You),
+                ..Default::default()
+            }),
+        };
+        let ev_start2 = state.event_log().len();
+        let out_empty = begin_resolution_frame(
+            &mut state,
+            StackItemId(522),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![all_gy_step],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(out_empty, FrameOutcome::Completed);
+        assert!(
+            state.event_log()[ev_start2..].iter().any(|ev| matches!(
+                ev.kind,
+                crate::events::AtomicEventKind::LibraryShuffled {
+                    player: PlayerId(0)
+                }
+            )),
+            "expected empty Selector::All move-shuffle to still shuffle PlayerId(0)"
+        );
+
+        // Regression check: LookAndReorder { may_shuffle: true } reorders top N >= 2, then prompts YesNo.
+        let mut look_step = make_step(EffectOp::LookAndReorder { may_shuffle: true });
+        look_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+        let lib_snapshot = state.player(PlayerId(0)).unwrap().library.clone();
+        let top_card = *lib_snapshot.last().unwrap();
+        let second_card = lib_snapshot[lib_snapshot.len() - 2];
+        let out_look = begin_resolution_frame(
+            &mut state,
+            StackItemId(523),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![look_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: lp, .. } = out_look else {
+            panic!("expected LookAndReorder ReorderLibrary pause");
+        };
+        assert!(matches!(
+            state.pending_prompt().map(|p| &p.request),
+            Some(ChoiceRequest::OrderObjects { objects, .. })
+                if objects == &[top_card, second_card]
+        ));
+        let out_look2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            lp,
+            ChoiceAnswer::OrderNext { id: second_card },
+        )
+        .unwrap();
+        let p0_lib_after_reorder = &state.player(PlayerId(0)).unwrap().library;
+        let len_after = p0_lib_after_reorder.len();
+        assert_eq!(len_after, lib_snapshot.len());
+        assert_eq!(p0_lib_after_reorder[len_after - 1], second_card);
+        assert_eq!(p0_lib_after_reorder[len_after - 2], top_card);
+
+        let FrameOutcome::Paused { prompt_id: yp, .. } = out_look2 else {
+            panic!("expected LookAndReorder may_shuffle YesNo prompt, got {out_look2:?}");
+        };
+        assert!(matches!(
+            state.pending_prompt().map(|p| &p.request),
+            Some(ChoiceRequest::YesNo { label, .. }) if label == "Shuffle your library?"
+        ));
+
+        let ev_start3 = state.event_log().len();
+        let out_look3 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            yp,
+            ChoiceAnswer::YesNo { value: true },
+        )
+        .unwrap();
+        assert_eq!(out_look3, FrameOutcome::Completed);
+        assert!(
+            state.event_log()[ev_start3..].iter().any(|ev| matches!(
+                ev.kind,
+                crate::events::AtomicEventKind::LibraryShuffled {
+                    player: PlayerId(0)
+                }
+            )),
+            "expected LookAndReorder may_shuffle YesNo=true to emit LibraryShuffled"
+        );
+    }
+
+    #[test]
+    fn synth_interactive_move_counters_loop_and_postcard_roundtrip() {
+        let mut tables = InternTables::default();
+        tables.counters.push("+1/+1".into());
+        let creature = synth_card_def(
+            "synth_counter_host",
+            "Synth Counter Host",
+            ColorMask::G,
+            CardTypeMask::CREATURE,
+            SmallVec::new(),
+            Some(mtg_ir::PrintedPt::Fixed {
+                power: 0,
+                toughness: 3,
+            }),
+            vec![],
+        );
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![creature],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 20],
+            sideboard: vec![],
+        };
+        let mut state = GameState::new(
+            Arc::clone(&db),
+            GameConfig::standard_1v1(),
+            &[deck.clone(), deck],
+            202,
+        )
+        .unwrap();
+        let spawn = |s: &mut GameState, owner: PlayerId| {
+            let ts = s.allocate_timestamp();
+            let id = s.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    owner,
+                    Zone::Battlefield,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            s.player_mut(owner).unwrap().battlefield.push(id);
+            s.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+            id
+        };
+        let src_c = spawn(&mut state, PlayerId(0));
+        let dst_a = spawn(&mut state, PlayerId(0));
+        let dst_b = spawn(&mut state, PlayerId(1));
+        state.add_counter(src_c, mtg_ir::CounterId(0), 3);
+
+        let mut mc_step = make_step(EffectOp::MoveCounters {
+            counter: Some(mtg_ir::CounterId(0)),
+            to_filter: Some(Box::new(ObjectFilter {
+                zones: mtg_ir::ZoneMask::BATTLEFIELD,
+                types_any: CardTypeMask::CREATURE,
+                ..Default::default()
+            })),
+            spec: None,
+        });
+        mc_step.subject = Selector::SelfObj;
+        mc_step.amount = None;
+
+        // Prompt 1: SelectTarget (min=0, max=1) excluding src_c
+        let out1 = begin_resolution_frame(
+            &mut state,
+            StackItemId(531),
+            PlayerId(0),
+            Some(src_c),
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![mc_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p1, .. } = out1 else {
+            panic!("expected MoveCountersSelectTarget pause, got {out1:?}");
+        };
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(ChoiceRequest::ChooseObjects {
+                candidates,
+                min,
+                max,
+                ..
+            }) => {
+                assert_eq!((*min, *max), (0, 1));
+                assert!(!candidates.contains(&src_c));
+                assert_eq!(candidates, &vec![dst_a, dst_b]);
+            }
+            other => panic!("expected ChooseObjects(0..=1), got {other:?}"),
+        }
+
+        // Pick dst_a -> ChooseNumber(1..=3)
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p1,
+            ChoiceAnswer::PickObject { id: dst_a },
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p2, .. } = out2 else {
+            panic!("expected MoveCountersChooseAmount pause, got {out2:?}");
+        };
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(ChoiceRequest::ChooseNumber { min, max, .. }) => {
+                assert_eq!((*min, *max), (1, 3));
+            }
+            other => panic!("expected ChooseNumber(1..=3), got {other:?}"),
+        }
+
+        // Postcard round-trip while paused on MoveCountersChooseAmount!
+        let bytes = postcard::to_allocvec(&state.to_snapshot()).unwrap();
+        let snap: crate::state::GameStateSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let mut restored = GameState::from_snapshot(Arc::clone(&db), snap);
+
+        // Pick amount 2 -> back to SelectTarget with remaining=1 (ChooseObjects 0..=1)
+        let out3 = resume_resolution_frame(
+            &mut restored,
+            PlayerId(0),
+            p2,
+            ChoiceAnswer::PickNumber { value: 2 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p3, .. } = out3 else {
+            panic!("expected second MoveCountersSelectTarget pause, got {out3:?}");
+        };
+        // Counters have not moved yet (atomic apply at end of loop).
+        assert_eq!(restored.counter_count(src_c, mtg_ir::CounterId(0)), 3);
+
+        // DonePicking finishes early and applies the 2 counters onto dst_a!
+        let out4 =
+            resume_resolution_frame(&mut restored, PlayerId(0), p3, ChoiceAnswer::DonePicking)
+                .unwrap();
+        assert_eq!(out4, FrameOutcome::Completed);
+        assert_eq!(restored.counter_count(src_c, mtg_ir::CounterId(0)), 1);
+        assert_eq!(restored.counter_count(dst_a, mtg_ir::CounterId(0)), 2);
+        assert_eq!(restored.counter_count(dst_b, mtg_ir::CounterId(0)), 0);
+    }
+
+    #[test]
+    fn synth_finalize_dig_partitions_pauses_on_replacement_roundtrips_and_resumes_remaining() {
+        let mut tables = InternTables::default();
+        tables.counters.push("+1/+1".into());
+        let make_rep_ench = |oracle_id: &str, name: &str, mod_spec: mtg_ir::ZoneChangeMod| {
+            synth_card_def(
+                oracle_id,
+                name,
+                ColorMask::W,
+                CardTypeMask::ENCHANTMENT,
+                SmallVec::new(),
+                None,
+                vec![mtg_ir::AbilityDef::Replacement(
+                    mtg_ir::ReplacementAbility {
+                        replacement: mtg_ir::ReplacementDef {
+                            replaces: mtg_ir::EventPattern {
+                                event: mtg_ir::EventKind::ZoneChange,
+                                filter: mtg_ir::EventFilter {
+                                    detail: Some(mtg_ir::EventDetail::ZoneChange {
+                                        from: mtg_ir::ZoneMask::LIBRARY,
+                                        to: Some(Zone::Exile),
+                                        from_anywhere: false,
+                                        not_from_zone: None,
+                                        not_to_zone: None,
+                                        enters_untapped: false,
+                                        dealt_damage_by_self_this_turn: false,
+                                    }),
+                                    ..Default::default()
+                                },
+                            },
+                            with: mtg_ir::ReplacementWith::ZoneChange {
+                                mod_spec: Box::new(mod_spec),
+                            },
+                            self_replacement: false,
+                            who: None,
+                            condition: None,
+                        },
+                        span: Default::default(),
+                    },
+                )],
+            )
+        };
+        let card_a = synth_card_def(
+            "synth_dig_a",
+            "Synth Dig A",
+            ColorMask::U,
+            CardTypeMask::CREATURE,
+            SmallVec::new(),
+            Some(mtg_ir::PrintedPt::Fixed {
+                power: 1,
+                toughness: 1,
+            }),
+            vec![],
+        );
+        let card_b = synth_card_def(
+            "synth_dig_b",
+            "Synth Dig B",
+            ColorMask::U,
+            CardTypeMask::CREATURE,
+            SmallVec::new(),
+            Some(mtg_ir::PrintedPt::Fixed {
+                power: 2,
+                toughness: 2,
+            }),
+            vec![],
+        );
+        let card_c = synth_card_def(
+            "synth_dig_c",
+            "Synth Dig C",
+            ColorMask::U,
+            CardTypeMask::CREATURE,
+            SmallVec::new(),
+            Some(mtg_ir::PrintedPt::Fixed {
+                power: 3,
+                toughness: 3,
+            }),
+            vec![],
+        );
+        let rep_exile_tapped = make_rep_ench(
+            "synth_rep_exile_tap",
+            "Synth Rep Exile Tap",
+            mtg_ir::ZoneChangeMod {
+                to: Some(Zone::Exile),
+                tapped: Some(true),
+                ..Default::default()
+            },
+        );
+        let rep_exile_to_gy = make_rep_ench(
+            "synth_rep_exile_gy",
+            "Synth Rep Exile Gy",
+            mtg_ir::ZoneChangeMod {
+                to: Some(Zone::Graveyard),
+                ..Default::default()
+            },
+        );
+        let rep_exile_counter = make_rep_ench(
+            "synth_rep_exile_ctr",
+            "Synth Rep Exile Ctr",
+            mtg_ir::ZoneChangeMod {
+                to: Some(Zone::Exile),
+                exile_with_counter: Some(mtg_ir::CounterId(0)),
+                ..Default::default()
+            },
+        );
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![
+                    card_a,
+                    card_b,
+                    card_c,
+                    rep_exile_tapped,
+                    rep_exile_to_gy,
+                    rep_exile_counter,
+                ],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![
+                CardDefId(0),
+                CardDefId(1),
+                CardDefId(2),
+                CardDefId(0),
+                CardDefId(1),
+                CardDefId(2),
+                CardDefId(0),
+                CardDefId(1),
+                CardDefId(2),
+                CardDefId(0),
+                CardDefId(1),
+                CardDefId(2),
+                CardDefId(0),
+                CardDefId(1),
+                CardDefId(2),
+            ],
+            sideboard: vec![],
+        };
+        let mut state = GameState::new(
+            Arc::clone(&db),
+            GameConfig::standard_1v1(),
+            &[deck.clone(), deck],
+            303,
+        )
+        .unwrap();
+
+        let put_bf = |s: &mut GameState, cd: CardDefId| {
+            let ts = s.allocate_timestamp();
+            let id = s.insert_object(
+                crate::state::GameObject::new(
+                    cd,
+                    PlayerId(0),
+                    Zone::Battlefield,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            s.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+            s.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+            id
+        };
+        put_bf(&mut state, CardDefId(3)); // rep_exile_tapped
+        put_bf(&mut state, CardDefId(5)); // rep_exile_counter
+
+        let lib = &state.player(PlayerId(0)).unwrap().library;
+        let top0 = lib[lib.len() - 1];
+        let top1 = lib[lib.len() - 2];
+        let top2 = lib[lib.len() - 3];
+        let top2_def = state.object(top2).unwrap().card_def;
+
+        let mut dig_step = make_step(EffectOp::Dig {
+            spec: Box::new(mtg_ir::DigSpec {
+                keep: 1,
+                up_to: false,
+                keep_filter: None,
+                keep_all_matching: false,
+                keep_label: None,
+                keep_to: mtg_ir::DigKeepTo::Hand,
+                keep_tapped: false,
+                keep_attacking: false,
+                keep_attacking_player: None,
+                reveal_all: false,
+                reveal_kept: false,
+                rest: mtg_ir::DigRestTo::LibraryBottom,
+                rest_random: false,
+                rest_order: None,
+                until_filter: None,
+                rest_to_hand: false,
+                shuffle_rest: false,
+                keep_max_mana_value: None,
+                keep_max_mv_strict_lt: false,
+                choose_one_of_exiled: false,
+                play_from_exile: None,
+                partitions: vec![
+                    mtg_ir::DigPartition {
+                        count: 1,
+                        to: mtg_ir::DigRestTo::LibraryBottom,
+                        to_hand: true,
+                        playable_this_turn: false,
+                    },
+                    mtg_ir::DigPartition {
+                        count: 1,
+                        to: mtg_ir::DigRestTo::Exile,
+                        to_hand: false,
+                        playable_this_turn: true,
+                    },
+                ],
+                destination_buckets: vec![],
+            }),
+            look_only: true,
+        });
+        dig_step.amount = Some(Box::new(Amount::Const { n: 3 }));
+        dig_step.bind_as = Some("dug".into());
+
+        let mut gain_step = make_step(EffectOp::GainLife {
+            set_life_total: false,
+        });
+        gain_step.amount = Some(Box::new(Amount::Const { n: 1 }));
+        gain_step.optional = Some(OptionalSpec {
+            mode: OptionalMode::DoIfPaid,
+            cost: vec![],
+            chooser: PlayerRef::You,
+        });
+
+        let out1 = begin_resolution_frame(
+            &mut state,
+            StackItemId(601),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![dig_step.clone(), gain_step.clone()],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p1, .. } = out1 else {
+            panic!("expected DigPick prompt 1, got {out1:?}");
+        };
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p1,
+            ChoiceAnswer::PickObject { id: top0 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p2, .. } = out2 else {
+            panic!("expected DigPick prompt 2, got {out2:?}");
+        };
+        let out3 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p2,
+            ChoiceAnswer::PickObject { id: top1 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: rep_pid, ..
+        } = out3
+        else {
+            panic!("expected WaitingOnReplacement pause, got {out3:?}");
+        };
+
+        assert!(matches!(
+            state.resolution_vms().last().and_then(|v| v.pause_state.as_ref()),
+            Some(StepPauseState::WaitingOnReplacement {
+                batch_idx: 1,
+                op_tag,
+                ..
+            }) if *op_tag == super::vm::OP_TAG_DIG
+        ));
+        assert_eq!(state.resolution_frames().last().unwrap().pc, 0);
+        assert_eq!(state.player(PlayerId(0)).unwrap().life, 20);
+        assert_eq!(
+            state.resolution_vms().last().unwrap().step_acted_ids.len(),
+            1
+        );
+        // top2 is still in library (PartitionBottom hasn't run yet).
+        assert!(state.player(PlayerId(0)).unwrap().library.contains(&top2));
+        assert!(
+            state
+                .player(PlayerId(0))
+                .unwrap()
+                .hand
+                .iter()
+                .any(|&id| state.object(id).is_some())
+        );
+
+        // Postcard round-trip while paused on OP_TAG_DIG!
+        let bytes = postcard::to_allocvec(&state.to_snapshot()).unwrap();
+        let snap: crate::state::GameStateSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let mut restored = GameState::from_snapshot(Arc::clone(&db), snap);
+
+        // Visibility & determinization during OP_TAG_DIG pause:
+        assert!(crate::observe::is_object_visible_to(
+            &restored,
+            top2,
+            Some(PlayerId(0))
+        ));
+        assert!(!crate::observe::is_object_visible_to(
+            &restored,
+            top2,
+            Some(PlayerId(1))
+        ));
+        let mut rng = crate::rng::RngState::splitmix64(99);
+        let det_p0 = crate::determinize::determinize_state(&restored, PlayerId(0), &mut rng);
+        assert_eq!(det_p0.object(top2).unwrap().card_def, top2_def);
+
+        // Resume replacement -> moves top1 to Exile (playable_this_turn), moves top2 to bottom, advances to Step 1 (GainLife optional pause).
+        let rep_out = crate::replace::resume_and_finalize_replacement(
+            &mut restored,
+            PlayerId(0),
+            rep_pid,
+            ChoiceAnswer::PickReplacement { index: 0 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: opt_pid, ..
+        } = resume_after_replacement(&mut restored, rep_out).unwrap()
+        else {
+            panic!("expected Step 1 optional pause");
+        };
+        assert_eq!(restored.resolution_frames().last().unwrap().pc, 1);
+        let dug_binding = restored
+            .resolution_frames()
+            .last()
+            .unwrap()
+            .bindings
+            .iter()
+            .find(|b| b.name == "dug")
+            .expect("dug binding must exist");
+        assert_eq!(dug_binding.objects.len(), 2);
+        assert!(!dug_binding.objects.contains(&top2));
+        let out4 = resume_resolution_frame(
+            &mut restored,
+            PlayerId(0),
+            opt_pid,
+            ChoiceAnswer::YesNo { value: true },
+        )
+        .unwrap();
+        assert_eq!(out4, FrameOutcome::Completed);
+        assert_eq!(restored.player(PlayerId(0)).unwrap().life, 21);
+        assert_eq!(restored.player(PlayerId(0)).unwrap().exile.len(), 1);
+        let exiled_id = restored.player(PlayerId(0)).unwrap().exile[0];
+        assert!(
+            restored
+                .rare(exiled_id)
+                .and_then(|r| r.playable_from_exile_by.as_ref())
+                .is_some(),
+            "PartitionSecond staying in Exile must grant playable_from_exile_by"
+        );
+        // top2 moved to library bottom (index 0; same-zone Library->Library preserves ObjectId).
+        let p0_lib_after = &restored.player(PlayerId(0)).unwrap().library;
+        assert_eq!(p0_lib_after[0], top2);
+        assert!(
+            restored
+                .object(p0_lib_after[0])
+                .is_some_and(|o| o.card_def == top2_def)
+        );
+
+        // Also verify redirect away from Exile (to Graveyard) does NOT grant playable_from_exile_by.
+        put_bf(&mut restored, CardDefId(4)); // rep_exile_to_gy
+        let lib2 = &restored.player(PlayerId(0)).unwrap().library;
+        let b0 = lib2[lib2.len() - 1];
+        let b1 = lib2[lib2.len() - 2];
+        let out_b1 = begin_resolution_frame(
+            &mut restored,
+            StackItemId(602),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![dig_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: bp1, .. } = out_b1 else {
+            panic!("expected DigPick");
+        };
+        let out_b2 = resume_resolution_frame(
+            &mut restored,
+            PlayerId(0),
+            bp1,
+            ChoiceAnswer::PickObject { id: b0 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: bp2, .. } = out_b2 else {
+            panic!("expected DigPick 2");
+        };
+        let out_b3 = resume_resolution_frame(
+            &mut restored,
+            PlayerId(0),
+            bp2,
+            ChoiceAnswer::PickObject { id: b1 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: brep, ..
+        } = out_b3
+        else {
+            panic!("expected ChooseReplacement");
+        };
+        let gy_rep_idx = restored
+            .pending_replacement()
+            .unwrap()
+            .candidates
+            .iter()
+            .position(|c| {
+                restored
+                    .object(c.object)
+                    .is_some_and(|o| o.card_def == CardDefId(4))
+            })
+            .unwrap() as u16;
+        let brep_out = crate::replace::resume_and_finalize_replacement(
+            &mut restored,
+            PlayerId(0),
+            brep,
+            ChoiceAnswer::PickReplacement { index: gy_rep_idx },
+        )
+        .unwrap();
+        let out_b4 = resume_after_replacement(&mut restored, brep_out).unwrap();
+        assert_eq!(out_b4, FrameOutcome::Completed);
+        assert_eq!(restored.player(PlayerId(0)).unwrap().graveyard.len(), 1);
+        let gy_id = restored.player(PlayerId(0)).unwrap().graveyard[0];
+        assert!(
+            restored
+                .rare(gy_id)
+                .and_then(|r| r.playable_from_exile_by.as_ref())
+                .is_none(),
+            "card redirected out of Exile must NOT get playable_from_exile_by"
+        );
+    }
+
+    #[test]
+    fn synth_finalize_dig_picks_pauses_on_replacement_and_shuffles_rest() {
+        let tables = InternTables::default();
+        let make_gy_rep = |oracle_id: &str, name: &str, to: Zone| {
+            synth_card_def(
+                oracle_id,
+                name,
+                ColorMask::W,
+                CardTypeMask::ENCHANTMENT,
+                SmallVec::new(),
+                None,
+                vec![mtg_ir::AbilityDef::Replacement(
+                    mtg_ir::ReplacementAbility {
+                        replacement: mtg_ir::ReplacementDef {
+                            replaces: mtg_ir::EventPattern {
+                                event: mtg_ir::EventKind::ZoneChange,
+                                filter: mtg_ir::EventFilter {
+                                    detail: Some(mtg_ir::EventDetail::ZoneChange {
+                                        from: mtg_ir::ZoneMask::LIBRARY,
+                                        to: Some(Zone::Graveyard),
+                                        from_anywhere: false,
+                                        not_from_zone: None,
+                                        not_to_zone: None,
+                                        enters_untapped: false,
+                                        dealt_damage_by_self_this_turn: false,
+                                    }),
+                                    ..Default::default()
+                                },
+                            },
+                            with: mtg_ir::ReplacementWith::ZoneChange {
+                                mod_spec: Box::new(mtg_ir::ZoneChangeMod {
+                                    to: Some(to),
+                                    ..Default::default()
+                                }),
+                            },
+                            self_replacement: false,
+                            who: None,
+                            condition: None,
+                        },
+                        span: Default::default(),
+                    },
+                )],
+            )
+        };
+        let bear = synth_card_def(
+            "synth_pick_bear",
+            "Synth Pick Bear",
+            ColorMask::G,
+            CardTypeMask::CREATURE,
+            SmallVec::new(),
+            Some(mtg_ir::PrintedPt::Fixed {
+                power: 2,
+                toughness: 2,
+            }),
+            vec![],
+        );
+        let rep_gy_exile = make_gy_rep("synth_gy_exile", "Synth Gy Exile", Zone::Exile);
+        let rep_gy_hand = make_gy_rep("synth_gy_hand", "Synth Gy Hand", Zone::Hand);
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![bear, rep_gy_exile, rep_gy_hand],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 20],
+            sideboard: vec![],
+        };
+        let mut state =
+            GameState::new(db, GameConfig::standard_1v1(), &[deck.clone(), deck], 404).unwrap();
+        for cd in [CardDefId(1), CardDefId(2)] {
+            let ts = state.allocate_timestamp();
+            let id = state.insert_object(
+                crate::state::GameObject::new(
+                    cd,
+                    PlayerId(0),
+                    Zone::Battlefield,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+        }
+        state.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+
+        let hand_before = state.player(PlayerId(0)).unwrap().hand.len();
+        let lib = &state.player(PlayerId(0)).unwrap().library;
+        let top0 = lib[lib.len() - 1];
+        let mut dig_step = make_step(EffectOp::Dig {
+            spec: Box::new(mtg_ir::DigSpec {
+                keep: 1,
+                up_to: false,
+                keep_filter: None,
+                keep_all_matching: false,
+                keep_label: None,
+                keep_to: mtg_ir::DigKeepTo::Hand,
+                keep_tapped: false,
+                keep_attacking: false,
+                keep_attacking_player: None,
+                reveal_all: false,
+                reveal_kept: false,
+                rest: mtg_ir::DigRestTo::Graveyard,
+                rest_random: false,
+                rest_order: None,
+                until_filter: None,
+                rest_to_hand: false,
+                shuffle_rest: true,
+                keep_max_mana_value: None,
+                keep_max_mv_strict_lt: false,
+                choose_one_of_exiled: false,
+                play_from_exile: None,
+                partitions: vec![],
+                destination_buckets: vec![],
+            }),
+            look_only: false,
+        });
+        dig_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+        dig_step.bind_as = Some("kept_only".into());
+
+        let ev_start = state.event_log().len();
+        let out1 = begin_resolution_frame(
+            &mut state,
+            StackItemId(603),
+            PlayerId(0),
+            None,
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![dig_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p1, .. } = out1 else {
+            panic!("expected DigPick pause, got {out1:?}");
+        };
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p1,
+            ChoiceAnswer::PickObject { id: top0 },
+        )
+        .unwrap();
+        let FrameOutcome::Paused {
+            prompt_id: rep_pid, ..
+        } = out2
+        else {
+            panic!("expected WaitingOnReplacement on PickRest, got {out2:?}");
+        };
+
+        assert!(matches!(
+            state.resolution_vms().last().and_then(|v| v.pause_state.as_ref()),
+            Some(StepPauseState::WaitingOnReplacement {
+                batch_idx: 1,
+                op_tag,
+                ..
+            }) if *op_tag == super::vm::OP_TAG_DIG
+        ));
+        assert_eq!(
+            state.player(PlayerId(0)).unwrap().hand.len(),
+            hand_before + 1
+        );
+        assert!(
+            !state.event_log()[ev_start..].iter().any(|ev| matches!(
+                ev.kind,
+                crate::events::AtomicEventKind::LibraryShuffled { .. }
+            )),
+            "shuffle_rest must NOT run while PickRest is paused on replacement"
+        );
+
+        let rep_out = crate::replace::resume_and_finalize_replacement(
+            &mut state,
+            PlayerId(0),
+            rep_pid,
+            ChoiceAnswer::PickReplacement { index: 0 },
+        )
+        .unwrap();
+        let out3 = resume_after_replacement(&mut state, rep_out).unwrap();
+        assert_eq!(out3, FrameOutcome::Completed);
+        assert!(
+            state.event_log()[ev_start..].iter().any(|ev| matches!(
+                ev.kind,
+                crate::events::AtomicEventKind::LibraryShuffled {
+                    player: PlayerId(0)
+                }
+            )),
+            "shuffle_rest must run once all Dig moves complete"
+        );
+    }
+
+    #[test]
+    fn synth_move_counters_clamps_remaining_above_i32_max() {
+        let mut tables = InternTables::default();
+        tables.counters.push("charge".into());
+        let creature = synth_card_def(
+            "synth_clamp_host",
+            "Synth Clamp Host",
+            ColorMask::G,
+            CardTypeMask::CREATURE,
+            SmallVec::new(),
+            Some(mtg_ir::PrintedPt::Fixed {
+                power: 1,
+                toughness: 1,
+            }),
+            vec![],
+        );
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![creature],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 20],
+            sideboard: vec![],
+        };
+        let mut state =
+            GameState::new(db, GameConfig::standard_1v1(), &[deck.clone(), deck], 505).unwrap();
+        let spawn = |s: &mut GameState| {
+            let ts = s.allocate_timestamp();
+            let id = s.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    PlayerId(0),
+                    Zone::Battlefield,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            s.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+            s.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+            id
+        };
+        let src_c = spawn(&mut state);
+        let dst_a = spawn(&mut state);
+        state.add_counter(src_c, mtg_ir::CounterId(0), u32::MAX);
+
+        let mut mc_step = make_step(EffectOp::MoveCounters {
+            counter: Some(mtg_ir::CounterId(0)),
+            to_filter: Some(Box::new(ObjectFilter {
+                zones: mtg_ir::ZoneMask::BATTLEFIELD,
+                types_any: CardTypeMask::CREATURE,
+                ..Default::default()
+            })),
+            spec: None,
+        });
+        mc_step.subject = Selector::SelfObj;
+
+        let out1 = begin_resolution_frame(
+            &mut state,
+            StackItemId(604),
+            PlayerId(0),
+            Some(src_c),
+            None,
+            0,
+            vec![],
+            vec![],
+            SmallVec::new(),
+            vec![mc_step],
+            vec![],
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p1, .. } = out1 else {
+            panic!("expected MoveCountersSelectTarget pause, got {out1:?}");
+        };
+        let out2 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p1,
+            ChoiceAnswer::PickObject { id: dst_a },
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p2, .. } = out2 else {
+            panic!("expected MoveCountersChooseAmount pause, got {out2:?}");
+        };
+        match state.pending_prompt().map(|p| &p.request) {
+            Some(ChoiceRequest::ChooseNumber { min, max, .. }) => {
+                assert_eq!((*min, *max), (1, i32::MAX));
+            }
+            other => panic!("expected ChooseNumber(1..=i32::MAX), got {other:?}"),
+        }
+        let legal = active_legal_actions(&state, PlayerId(0));
+        assert!(
+            legal.iter().any(|a| matches!(
+                a,
+                Action::Answer {
+                    answer: ChoiceAnswer::PickNumber { value },
+                    ..
+                } if *value == i32::MAX
+            )),
+            "legal actions must include PickNumber(i32::MAX) when remaining == u32::MAX"
+        );
+
+        let out3 = resume_resolution_frame(
+            &mut state,
+            PlayerId(0),
+            p2,
+            ChoiceAnswer::PickNumber { value: i32::MAX },
+        )
+        .unwrap();
+        let FrameOutcome::Paused { prompt_id: p3, .. } = out3 else {
+            panic!("expected second MoveCountersSelectTarget pause, got {out3:?}");
+        };
+        let out4 = resume_resolution_frame(&mut state, PlayerId(0), p3, ChoiceAnswer::DonePicking)
+            .unwrap();
+        assert_eq!(out4, FrameOutcome::Completed);
+        assert_eq!(
+            state.counter_count(src_c, mtg_ir::CounterId(0)),
+            u32::MAX - (i32::MAX as u32)
+        );
+        assert_eq!(
+            state.counter_count(dst_a, mtg_ir::CounterId(0)),
+            i32::MAX as u32
+        );
+    }
+
+    #[test]
+    fn synth_vm_pause_invalid_answer_preserves_prompt_and_pause_state() {
+        let assert_vm_pause_preserved = |state: &GameState, expected_pp: &PendingPromptContext| {
+            assert!(crate::choices::is_prompt_active(state));
+            assert_eq!(state.pending_prompt(), Some(expected_pp));
+            assert!(matches!(state.decision(), DecisionState::Prompt { .. }));
+            assert!(
+                state
+                    .resolution_vms()
+                    .last()
+                    .and_then(|v| v.pause_state.as_ref())
+                    .is_some()
+            );
+            assert_eq!(
+                state
+                    .resolution_frames()
+                    .last()
+                    .and_then(|f| f.pending_prompt_id),
+                Some(expected_pp.prompt_id)
+            );
+            assert!(!crate::choices::legal_choice_actions(state, expected_pp.chooser).is_empty());
+        };
+
+        // 1. SelectionPick (wrong variant, invalid/duplicate id, DonePicking below min)
+        {
+            let mut state = synth_db_and_state(false);
+            let spawn_c = |s: &mut GameState| {
+                let ts = s.allocate_timestamp();
+                let id = s.insert_object(
+                    crate::state::GameObject::new(
+                        CardDefId(0),
+                        PlayerId(0),
+                        Zone::Battlefield,
+                        ts,
+                        crate::state::ObjectFlags::empty(),
+                    ),
+                    None,
+                );
+                s.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+                s.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+                id
+            };
+            let c1 = spawn_c(&mut state);
+            let _c2 = spawn_c(&mut state);
+            let mut step = make_step(EffectOp::Tap {
+                select: mtg_ir::SelectionMod {
+                    up_to: false,
+                    choice_count: Some(Box::new(Amount::Const { n: 1 })),
+                    ..Default::default()
+                },
+            });
+            step.subject = Selector::All {
+                filter: Box::new(ObjectFilter {
+                    zones: mtg_ir::ZoneMask::BATTLEFIELD,
+                    ..Default::default()
+                }),
+            };
+            let FrameOutcome::Paused { prompt_id, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(901),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected SelectionPick pause");
+            };
+            let pp = state.pending_prompt().unwrap().clone();
+            let bogus_id = state.player(PlayerId(1)).unwrap().hand[0];
+
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::PickObject { id: bogus_id },
+                ChoiceAnswer::DonePicking,
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), prompt_id, bad)
+                        .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp);
+            }
+            assert!(
+                resume_resolution_frame(
+                    &mut state,
+                    PlayerId(1),
+                    prompt_id,
+                    ChoiceAnswer::PickObject { id: c1 },
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&state, &pp);
+
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                prompt_id,
+                ChoiceAnswer::PickObject { id: c1 },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+            assert!(state.resolution_frames().is_empty());
+        }
+
+        // 2. SearchPick (wrong variant, invalid id, DonePicking below min)
+        {
+            let mut state = synth_db_and_state(false);
+            let step = make_step(EffectOp::Search {
+                spec: Box::new(mtg_ir::SearchSpec {
+                    filter: Box::new(ObjectFilter {
+                        types_any: CardTypeMask::LAND,
+                        ..Default::default()
+                    }),
+                    count: 1,
+                    up_to: false,
+                    stated_quality: false,
+                    destinations: vec![mtg_ir::SearchDestination {
+                        zone: Zone::Hand,
+                        tapped: false,
+                        on_top: false,
+                    }],
+                    reveal: false,
+                    description: None,
+                    zones: mtg_ir::ZoneMask::LIBRARY,
+                    different_names: false,
+                    shuffle_only_if_library: false,
+                    searched_player: None,
+                    cast_free: false,
+                    target_controller_as_actor: false,
+                }),
+                tapped: false,
+            });
+            let lib0 = state.player(PlayerId(0)).unwrap().library[0];
+            let hand0 = state.player(PlayerId(0)).unwrap().hand[0];
+            let FrameOutcome::Paused { prompt_id, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(902),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected SearchPick pause");
+            };
+            let pp = state.pending_prompt().unwrap().clone();
+            for bad in [
+                ChoiceAnswer::YesNo { value: false },
+                ChoiceAnswer::PickObject { id: hand0 },
+                ChoiceAnswer::DonePicking,
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), prompt_id, bad)
+                        .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                prompt_id,
+                ChoiceAnswer::PickObject { id: lib0 },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // 3. ReorderLibrary (Scry YesNo + LookAndReorder OrderObjects)
+        {
+            let mut state = synth_db_and_state(false);
+            let mut scry_step = make_step(EffectOp::Scry);
+            scry_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+            let FrameOutcome::Paused { prompt_id: sp1, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(903),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![scry_step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected Scry YesNo pause");
+            };
+            let pp_scry = state.pending_prompt().unwrap().clone();
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(0),
+                    sp1,
+                    ChoiceAnswer::DonePicking,
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&state, &pp_scry);
+
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                sp1,
+                ChoiceAnswer::YesNo { value: false },
+            )
+            .unwrap();
+            let sp2 = state.pending_prompt().unwrap().prompt_id;
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                sp2,
+                ChoiceAnswer::YesNo { value: false },
+            )
+            .unwrap();
+            // Now OrderObjects for the 2 top cards
+            let pp_ord = state.pending_prompt().unwrap().clone();
+            let top0 = match &pp_ord.request {
+                ChoiceRequest::OrderObjects { objects, .. } => objects[0],
+                other => panic!("expected OrderObjects, got {other:?}"),
+            };
+            let hand0 = state.player(PlayerId(0)).unwrap().hand[0];
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::OrderNext { id: hand0 },
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(
+                        &mut state,
+                        PlayerId(0),
+                        pp_ord.prompt_id,
+                        bad,
+                    )
+                    .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp_ord);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                pp_ord.prompt_id,
+                ChoiceAnswer::OrderNext { id: top0 },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // 4. DigPick (wrong variant, invalid id, DonePicking below min)
+        {
+            let mut state = synth_db_and_state(false);
+            let mut dig_step = make_step(EffectOp::Dig {
+                spec: Box::new(mtg_ir::DigSpec {
+                    keep: 1,
+                    up_to: false,
+                    keep_filter: None,
+                    keep_all_matching: false,
+                    keep_label: None,
+                    keep_to: mtg_ir::DigKeepTo::Hand,
+                    keep_tapped: false,
+                    keep_attacking: false,
+                    keep_attacking_player: None,
+                    reveal_all: false,
+                    reveal_kept: false,
+                    rest: mtg_ir::DigRestTo::LibraryBottom,
+                    rest_random: false,
+                    rest_order: None,
+                    until_filter: None,
+                    rest_to_hand: false,
+                    shuffle_rest: false,
+                    keep_max_mana_value: None,
+                    keep_max_mv_strict_lt: false,
+                    choose_one_of_exiled: false,
+                    play_from_exile: None,
+                    partitions: vec![],
+                    destination_buckets: vec![],
+                }),
+                look_only: false,
+            });
+            dig_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+            let FrameOutcome::Paused { prompt_id, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(904),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![dig_step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected DigPick pause");
+            };
+            let pp = state.pending_prompt().unwrap().clone();
+            let valid_dig = match &pp.request {
+                ChoiceRequest::ChooseObjects { candidates, .. } => candidates[0],
+                other => panic!("expected ChooseObjects, got {other:?}"),
+            };
+            let hand0 = state.player(PlayerId(0)).unwrap().hand[0];
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::PickObject { id: hand0 },
+                ChoiceAnswer::DonePicking,
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), prompt_id, bad)
+                        .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                prompt_id,
+                ChoiceAnswer::PickObject { id: valid_dig },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // 5. ChooseNumber (wrong variant, below min, above max)
+        {
+            let mut state = synth_db_and_state(false);
+            let mut draw_step = make_step(EffectOp::Draw {
+                up_to: true,
+                reveal_drawn: false,
+            });
+            draw_step.amount = Some(Box::new(Amount::Const { n: 3 }));
+            let FrameOutcome::Paused { prompt_id, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(905),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![draw_step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected ChooseNumber pause");
+            };
+            let pp = state.pending_prompt().unwrap().clone();
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::PickNumber { value: -1 },
+                ChoiceAnswer::PickNumber { value: 4 },
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), prompt_id, bad)
+                        .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                prompt_id,
+                ChoiceAnswer::PickNumber { value: 2 },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // 6. ChooseMode (out-of-range, duplicate, DonePicking below min)
+        {
+            let mut state = synth_db_and_state(false);
+            let mut odd_even = make_step(EffectOp::CombatRestriction {
+                spec: None,
+                duration: Some(mtg_ir::Duration::EndOfTurn),
+                choose_odd_or_even_cant_block: true,
+                must_attack_next_combat: false,
+                must_attack_player: None,
+                until_your_next_turn_directive: None,
+            });
+            odd_even.subject = Selector::PlayerRef {
+                player: mtg_ir::PlayerRef::You,
+            };
+            let FrameOutcome::Paused { prompt_id, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(906),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![odd_even],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected ChooseMode pause");
+            };
+            let pp = state.pending_prompt().unwrap().clone();
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::PickMode { index: 5 },
+                ChoiceAnswer::DonePicking,
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), prompt_id, bad)
+                        .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                prompt_id,
+                ChoiceAnswer::PickMode { index: 0 },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+
+            // Also verify duplicate mode index rejection when min=2, max=2 via ProliferatePlayers
+            let mut tables = InternTables::default();
+            tables.counters.push("+1/+1".into());
+            let db_p = Arc::new(
+                CardDatabase::from_bundle(IrV2Bundle {
+                    ir_version: IR_V2_VERSION,
+                    source_compiler_version: 46,
+                    tables,
+                    cards: vec![state.db().cards[0].clone()],
+                    decks: vec![],
+                })
+                .unwrap(),
+            );
+            let deck = DeckSpec {
+                commanders: vec![],
+                mainboard: vec![CardDefId(0); 15],
+                sideboard: vec![],
+            };
+            let mut pstate =
+                GameState::new(db_p, GameConfig::standard_1v1(), &[deck.clone(), deck], 801)
+                    .unwrap();
+            pstate.player_mut(PlayerId(0)).unwrap().poison = 1;
+            pstate.player_mut(PlayerId(1)).unwrap().poison = 1;
+            let prolif = make_step(EffectOp::Proliferate);
+            let FrameOutcome::Paused { prompt_id: mp1, .. } = begin_resolution_frame(
+                &mut pstate,
+                StackItemId(907),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![prolif],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected ChooseMode for ProliferatePlayers");
+            };
+            crate::choices::apply_choice_answer(
+                &mut pstate,
+                PlayerId(0),
+                mp1,
+                ChoiceAnswer::PickMode { index: 0 },
+            )
+            .unwrap();
+            let pp_dup = pstate.pending_prompt().unwrap().clone();
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut pstate,
+                    PlayerId(0),
+                    pp_dup.prompt_id,
+                    ChoiceAnswer::PickMode { index: 0 },
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&pstate, &pp_dup);
+        }
+
+        // 7. MoveCountersSelectTarget & MoveCountersChooseAmount
+        {
+            let mut tables = InternTables::default();
+            tables.counters.push("+1/+1".into());
+            let cdef = synth_card_def(
+                "synth_mc_host",
+                "Synth Mc Host",
+                ColorMask::G,
+                CardTypeMask::CREATURE,
+                SmallVec::new(),
+                Some(mtg_ir::PrintedPt::Fixed {
+                    power: 0,
+                    toughness: 3,
+                }),
+                vec![],
+            );
+            let db = Arc::new(
+                CardDatabase::from_bundle(IrV2Bundle {
+                    ir_version: IR_V2_VERSION,
+                    source_compiler_version: 46,
+                    tables,
+                    cards: vec![cdef],
+                    decks: vec![],
+                })
+                .unwrap(),
+            );
+            let deck = DeckSpec {
+                commanders: vec![],
+                mainboard: vec![CardDefId(0); 15],
+                sideboard: vec![],
+            };
+            let mut state =
+                GameState::new(db, GameConfig::standard_1v1(), &[deck.clone(), deck], 802).unwrap();
+            let spawn = |s: &mut GameState| {
+                let ts = s.allocate_timestamp();
+                let id = s.insert_object(
+                    crate::state::GameObject::new(
+                        CardDefId(0),
+                        PlayerId(0),
+                        Zone::Battlefield,
+                        ts,
+                        crate::state::ObjectFlags::empty(),
+                    ),
+                    None,
+                );
+                s.player_mut(PlayerId(0)).unwrap().battlefield.push(id);
+                s.mark_dirty(crate::state::DirtyMask::TOPOLOGY);
+                id
+            };
+            let src_c = spawn(&mut state);
+            let dst_a = spawn(&mut state);
+            state.add_counter(src_c, mtg_ir::CounterId(0), 3);
+
+            let mut mc_step = make_step(EffectOp::MoveCounters {
+                counter: Some(mtg_ir::CounterId(0)),
+                to_filter: Some(Box::new(ObjectFilter {
+                    zones: mtg_ir::ZoneMask::BATTLEFIELD,
+                    types_any: CardTypeMask::CREATURE,
+                    ..Default::default()
+                })),
+                spec: None,
+            });
+            mc_step.subject = Selector::SelfObj;
+            let FrameOutcome::Paused { prompt_id: p1, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(908),
+                PlayerId(0),
+                Some(src_c),
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![mc_step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected MoveCountersSelectTarget pause");
+            };
+            let pp1 = state.pending_prompt().unwrap().clone();
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::PickObject { id: src_c },
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), p1, bad).is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp1);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                p1,
+                ChoiceAnswer::PickObject { id: dst_a },
+            )
+            .unwrap();
+
+            let pp2 = state.pending_prompt().unwrap().clone();
+            for bad in [
+                ChoiceAnswer::YesNo { value: true },
+                ChoiceAnswer::PickNumber { value: 0 },
+                ChoiceAnswer::PickNumber { value: 4 },
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(
+                        &mut state,
+                        PlayerId(0),
+                        pp2.prompt_id,
+                        bad,
+                    )
+                    .is_err()
+                );
+                assert_vm_pause_preserved(&state, &pp2);
+            }
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                pp2.prompt_id,
+                ChoiceAnswer::PickNumber { value: 3 },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // 8. OptionalChoice & GuidedResolution (wrong variant, wrong actor/prompt_id via resume_resolution_frame)
+        {
+            let mut state = synth_db_and_state(false);
+            let mut opt_step = make_step(EffectOp::GainLife {
+                set_life_total: false,
+            });
+            opt_step.amount = Some(Box::new(Amount::Const { n: 2 }));
+            opt_step.optional = Some(OptionalSpec {
+                mode: OptionalMode::DoIfPaid,
+                cost: vec![],
+                chooser: PlayerRef::You,
+            });
+            let FrameOutcome::Paused { prompt_id, .. } = begin_resolution_frame(
+                &mut state,
+                StackItemId(909),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![opt_step],
+                vec![],
+            )
+            .unwrap() else {
+                panic!("expected OptionalChoice pause");
+            };
+            let pp = state.pending_prompt().unwrap().clone();
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(0),
+                    prompt_id,
+                    ChoiceAnswer::DonePicking,
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&state, &pp);
+            assert!(
+                resume_resolution_frame(
+                    &mut state,
+                    PlayerId(1),
+                    prompt_id,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&state, &pp);
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                prompt_id,
+                ChoiceAnswer::YesNo { value: true },
+            )
+            .unwrap();
+            assert_eq!(state.player(PlayerId(0)).unwrap().life, 22);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+
+            let mut guided_state = synth_db_and_state(true);
+            let FrameOutcome::Paused {
+                prompt_id: gpid, ..
+            } = begin_resolution_frame(
+                &mut guided_state,
+                StackItemId(910),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![],
+                vec![],
+                SmallVec::new(),
+                vec![make_step(EffectOp::Discover)],
+                vec![],
+            )
+            .unwrap()
+            else {
+                panic!("expected GuidedResolution pause");
+            };
+            let gpp = guided_state.pending_prompt().unwrap().clone();
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut guided_state,
+                    PlayerId(0),
+                    gpid,
+                    ChoiceAnswer::DonePicking,
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&guided_state, &gpp);
+            assert!(
+                resume_resolution_frame(
+                    &mut guided_state,
+                    PlayerId(1),
+                    gpid,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&guided_state, &gpp);
+            assert!(
+                resume_resolution_frame(
+                    &mut guided_state,
+                    PlayerId(0),
+                    gpid + 1,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_vm_pause_preserved(&guided_state, &gpp);
+            crate::choices::apply_choice_answer(
+                &mut guided_state,
+                PlayerId(0),
+                gpid,
+                ChoiceAnswer::YesNo { value: true },
+            )
+            .unwrap();
+            assert!(guided_state.pending_prompt().is_none());
+            assert_eq!(guided_state.decision(), &DecisionState::Priority);
+        }
+
+        // 9. WaitingOnReplacement — direct resume_resolution_frame returns Err and preserves replacement + pause_state + pending_prompt_id
+        {
+            let tables = InternTables::default();
+            let shockland = CardDef {
+                oracle_id: "synth_vm_wait_rep_land".into(),
+                compiler_version: 46,
+                text_hash: "0".into(),
+                name: "Synth Vm Wait Rep Land".into(),
+                layout: CardLayout::Normal,
+                faces: vec![FaceDef {
+                    name: "Synth Vm Wait Rep Land".into(),
+                    characteristics: Characteristics {
+                        mana_cost: ManaCost::default(),
+                        types: CardTypeMask::LAND,
+                        subtypes: SmallVec::new(),
+                        supertypes: SupertypeMask::empty(),
+                        colors: ColorMask::empty(),
+                        color_indicator: None,
+                        pt: None,
+                        loyalty: None,
+                        defense: None,
+                    },
+                    abilities: vec![mtg_ir::AbilityDef::Replacement(
+                        mtg_ir::ReplacementAbility {
+                            replacement: mtg_ir::ReplacementDef {
+                                replaces: mtg_ir::EventPattern {
+                                    event: mtg_ir::EventKind::ZoneChange,
+                                    filter: mtg_ir::EventFilter {
+                                        or_self: true,
+                                        detail: Some(mtg_ir::EventDetail::ZoneChange {
+                                            from: mtg_ir::ZoneMask::empty(),
+                                            to: Some(Zone::Battlefield),
+                                            from_anywhere: true,
+                                            not_from_zone: None,
+                                            not_to_zone: None,
+                                            enters_untapped: false,
+                                            dealt_damage_by_self_this_turn: false,
+                                        }),
+                                        ..Default::default()
+                                    },
+                                },
+                                with: mtg_ir::ReplacementWith::ZoneChange {
+                                    mod_spec: Box::new(mtg_ir::ZoneChangeMod {
+                                        pay_life_or_enter_tapped: Some(2),
+                                        ..Default::default()
+                                    }),
+                                },
+                                self_replacement: true,
+                                who: None,
+                                condition: None,
+                            },
+                            span: Default::default(),
+                        },
+                    )],
+                    has_read_ahead: false,
+                    prototype_spec: None,
+                    cleaved_spell_spec: None,
+                    gift_promised_spell_spec: None,
+                }],
+                fully_supported: true,
+            };
+            let db = Arc::new(
+                CardDatabase::from_bundle(IrV2Bundle {
+                    ir_version: IR_V2_VERSION,
+                    source_compiler_version: 46,
+                    tables,
+                    cards: vec![shockland],
+                    decks: vec![],
+                })
+                .unwrap(),
+            );
+            let deck = DeckSpec {
+                commanders: vec![],
+                mainboard: vec![CardDefId(0); 20],
+                sideboard: vec![],
+            };
+            let mut state =
+                GameState::new(db, GameConfig::standard_1v1(), &[deck.clone(), deck], 803).unwrap();
+            let ts = state.allocate_timestamp();
+            let hand_land = state.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    PlayerId(0),
+                    Zone::Hand,
+                    ts,
+                    crate::state::ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().hand.push(hand_land);
+            let mut mv_step = make_step(EffectOp::Move {
+                from: Some(Zone::Hand),
+                to: Some(Zone::Battlefield),
+                select: mtg_ir::SelectionMod::default(),
+                tapped: false,
+                under_your_control: true,
+                topmost_only: false,
+                may_shuffle: false,
+                position: None,
+                from_top: None,
+                library_choice_by: None,
+                random_order: false,
+                entered_transformed: false,
+                entered_flipped: false,
+                enters_tapped_and_attacking: false,
+                as_enchantment_only: false,
+                unearth: false,
+                with_counters: None,
+                attached_to: None,
+                condition: None,
+                choose_at_random_from_exiled_with_self: false,
+                leave_chosen_in_graveyard_rest_to_hand: false,
+                split_exiled_cost_cards_to_bottom_and_battlefield: false,
+            });
+            mv_step.subject = Selector::Target { index: 0 };
+            let FrameOutcome::Paused {
+                prompt_id: rep_pid, ..
+            } = begin_resolution_frame(
+                &mut state,
+                StackItemId(911),
+                PlayerId(0),
+                None,
+                None,
+                0,
+                vec![TargetRef::Object { id: hand_land }],
+                vec![],
+                SmallVec::new(),
+                vec![mv_step],
+                vec![],
+            )
+            .unwrap()
+            else {
+                panic!("expected WaitingOnReplacement pause");
+            };
+
+            assert!(
+                resume_resolution_frame(
+                    &mut state,
+                    PlayerId(0),
+                    rep_pid,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert!(state.pending_replacement().is_some());
+            assert!(matches!(
+                state
+                    .resolution_vms()
+                    .last()
+                    .and_then(|v| v.pause_state.as_ref()),
+                Some(StepPauseState::WaitingOnReplacement { .. })
+            ));
+            assert_eq!(
+                state
+                    .resolution_frames()
+                    .last()
+                    .and_then(|f| f.pending_prompt_id),
+                Some(rep_pid)
+            );
+        }
     }
 }

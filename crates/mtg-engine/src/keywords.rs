@@ -1,7 +1,8 @@
 use mtg_ir::{
-    AbilityDef, Affected, CardDatabase, CardTypeMask, ColorMask, CombatRuleSpec, KeywordDef,
-    KeywordId, ObjectFilter, ProtectionAttachmentExemption, RestrictionKind, StaticBody,
-    SupertypeMask, Zone, ZoneMask,
+    AbilityDef, ActivatedAbility, ActivatorWho, Affected, CardDatabase, CardTypeMask, ColorMask,
+    CombatRuleSpec, CostDef, EffectOp, EffectStep, KeywordAbility, KeywordDef, KeywordId,
+    ObjectFilter, ProtectionAttachmentExemption, RelativeControl, RestrictionKind, SelectionMod,
+    Selector, StaticBody, SupertypeMask, TargetKind, TargetSpec, Timing, Zone, ZoneMask,
 };
 
 use crate::action::TargetRef;
@@ -987,6 +988,142 @@ pub fn keyword_id_ci(db: &CardDatabase, name: &str) -> Option<KeywordId> {
         .enumerate()
         .find(|(_, k)| k.eq_ignore_ascii_case(name))
         .map(|(i, _)| KeywordId(i as u16))
+}
+
+/// Returns the activation zone mask if `kw_ab` is a keyword-backed activated ability
+/// synthesized by [`synthesize_keyword_activated_ability`] (`Equip` `CR 702.6a`, `Fortify` `CR 702.67a`).
+#[inline]
+pub(crate) fn keyword_activated_zones(
+    db: &CardDatabase,
+    kw_ab: &KeywordAbility,
+) -> Option<ZoneMask> {
+    let name = db.keyword_name(kw_ab.keyword.keyword)?;
+    if name.eq_ignore_ascii_case("equip") || name.eq_ignore_ascii_case("fortify") {
+        Some(ZoneMask::BATTLEFIELD)
+    } else {
+        None
+    }
+}
+
+/// Synthesizes an [`ActivatedAbility`] on the fly for `AbilityDef::Keyword` entries whose CR rules
+/// define an activated ability (`Equip` `CR 702.6a`, `Fortify` `CR 702.67a`).
+pub(crate) fn synthesize_keyword_activated_ability(
+    db: &CardDatabase,
+    kw_ab: &KeywordAbility,
+    fallback_idx: usize,
+) -> Option<ActivatedAbility> {
+    let raw_name = db.keyword_name(kw_ab.keyword.keyword)?;
+    let (canonical_name, is_fortify) = if raw_name.eq_ignore_ascii_case("equip") {
+        ("equip", false)
+    } else if raw_name.eq_ignore_ascii_case("fortify") {
+        ("fortify", true)
+    } else {
+        return None;
+    };
+
+    let id = kw_ab
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{canonical_name}_{fallback_idx}"));
+
+    let mut cost = kw_ab.keyword.cost_defs.clone();
+    if cost.is_empty()
+        && let Some(mc) = &kw_ab.keyword.cost
+        && (mc.generic > 0 || mc.x_count > 0 || !mc.pips.is_empty())
+    {
+        cost.push(CostDef::Mana {
+            cost: mc.clone(),
+            x_spend_colors: ColorMask::empty(),
+            x_colored_only: false,
+            x_max_one_per_color: false,
+        });
+    }
+
+    let mut filter = if !is_fortify {
+        kw_ab
+            .keyword
+            .equip_filter
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        ObjectFilter::default()
+    };
+    filter.zones = ZoneMask::BATTLEFIELD;
+    filter.controller = Some(RelativeControl::You);
+    if is_fortify {
+        filter.types_any = CardTypeMask::LAND;
+    } else if filter.types_any.is_empty() {
+        filter.types_any = if kw_ab.keyword.equip_allow_planeswalker {
+            CardTypeMask::CREATURE | CardTypeMask::PLANESWALKER
+        } else {
+            CardTypeMask::CREATURE
+        };
+    }
+
+    let target = TargetSpec {
+        kind: TargetKind::Object,
+        filter,
+        player: None,
+        min: 1,
+        max: 1,
+        same_owner: false,
+        condition: None,
+        other_target: false,
+        divide_total: None,
+        with_single_target: false,
+        dynamic_count: None,
+        dynamic_up_to: false,
+        max_total_mana_value: None,
+        also_spells: false,
+        per_opponent: false,
+        different_controllers: false,
+        chosen_by_event_player: false,
+        shares_card_type_with_target: None,
+        zones: ZoneMask::BATTLEFIELD,
+    };
+
+    let step = EffectStep {
+        op: EffectOp::Attach {
+            attach_object: None,
+            select: SelectionMod::default(),
+            attach_equipment_from_self_lki: false,
+        },
+        subject: Selector::Target { index: 0 },
+        actor: None,
+        amount: None,
+        optional: None,
+        gate: None,
+        bind_as: None,
+        do_this_once_per_turn: false,
+        reflexive_trigger: None,
+        span: kw_ab.span,
+    };
+
+    Some(ActivatedAbility {
+        id,
+        cost,
+        targets: vec![target],
+        effect: vec![step],
+        modal: None,
+        timing: Timing::Sorcery,
+        is_mana: false,
+        activation_restrictions: Vec::new(),
+        activation_condition: None,
+        activator_who: Some(ActivatorWho::You),
+        power_up_reduction: false,
+        x_cant_be_zero: false,
+        activation_cost_reduction: kw_ab.keyword.equip_cost_reduction.clone(),
+        activation_zones: ZoneMask::BATTLEFIELD,
+        cost_keyword: Some(kw_ab.keyword.keyword),
+        intrinsic: false,
+        text: None,
+        grant_condition: None,
+        x_spend_colors: ColorMask::empty(),
+        x_colored_only: false,
+        x_max_one_per_color: false,
+        span: kw_ab.span,
+    })
 }
 
 #[inline]

@@ -1740,6 +1740,8 @@ pub enum StepPauseState {
         min: u16,
         max: u16,
         destinations: Vec<mtg_ir::SearchDestination>,
+        dest_idx: usize,
+        moved_ids: Vec<ObjectId>,
         shuffle_library: bool,
         reveal: bool,
         tapped: bool,
@@ -1760,6 +1762,7 @@ pub enum StepPauseState {
         selected: Vec<ObjectId>,
         min: u16,
         max: u16,
+        partition_picks: Vec<ObjectId>,
     },
     ChooseNumber {
         chooser: PlayerId,
@@ -1773,6 +1776,23 @@ pub enum StepPauseState {
         allow_duplicates: bool,
         min: u16,
         max: u16,
+    },
+    MoveCountersSelectTarget {
+        chooser: PlayerId,
+        from_id: ObjectId,
+        counter: CounterId,
+        candidates: Vec<ObjectId>,
+        remaining: u32,
+        transfers: Vec<(ObjectId, u32)>,
+    },
+    MoveCountersChooseAmount {
+        chooser: PlayerId,
+        from_id: ObjectId,
+        counter: CounterId,
+        candidates: Vec<ObjectId>,
+        target_id: ObjectId,
+        remaining: u32,
+        transfers: Vec<(ObjectId, u32)>,
     },
     GuidedResolution {
         controller: PlayerId,
@@ -1831,6 +1851,15 @@ pub struct StepWayStats {
     pub not_put_onto_bf_by_this_ability: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DigMoveRole {
+    PartitionHand,
+    PartitionSecond,
+    PartitionBottom,
+    PickKept,
+    PickRest,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PendingStepContinuation {
     pub remaining_players: SmallVec<[PlayerId; 4]>,
@@ -1840,15 +1869,21 @@ pub struct PendingStepContinuation {
     pub fight_excess_mana: Option<ManaColor>,
     pub search_moved_ids: Vec<ObjectId>,
     pub search_destinations: Vec<mtg_ir::SearchDestination>,
+    pub search_dest_idx: usize,
+    pub search_different_names: bool,
+    pub search_candidates: Vec<ObjectId>,
     pub search_searched_player: Option<PlayerId>,
     pub search_chooser: Option<PlayerId>,
     pub search_shuffle: bool,
     pub search_reveal: bool,
     pub search_tapped: bool,
+    pub move_shuffle_owners: SmallVec<[PlayerId; 4]>,
     pub proliferate_count: u32,
     pub proliferate_selected_perms: Vec<ObjectId>,
     pub proliferate_counter_queue: Vec<(ObjectId, CounterId)>,
     pub proliferate_chosen_players: SmallVec<[PlayerId; 4]>,
+    pub dig_player: Option<PlayerId>,
+    pub dig_roles: SmallVec<[DigMoveRole; 8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3900,13 +3935,22 @@ impl GameState {
                         candidates,
                         selected,
                         ..
-                    }
-                    | StepPauseState::SearchPick {
-                        candidates,
-                        selected,
-                        ..
                     } => {
                         for &id in candidates.iter().chain(selected.iter()) {
+                            push_oid(&mut keep, id);
+                        }
+                    }
+                    StepPauseState::SearchPick {
+                        candidates,
+                        selected,
+                        moved_ids,
+                        ..
+                    } => {
+                        for &id in candidates
+                            .iter()
+                            .chain(selected.iter())
+                            .chain(moved_ids.iter())
+                        {
                             push_oid(&mut keep, id);
                         }
                     }
@@ -3932,13 +3976,45 @@ impl GameState {
                         revealed,
                         candidates,
                         selected,
+                        partition_picks,
                         ..
                     } => {
                         for &id in revealed
                             .iter()
                             .chain(candidates.iter())
                             .chain(selected.iter())
+                            .chain(partition_picks.iter())
                         {
+                            push_oid(&mut keep, id);
+                        }
+                    }
+                    StepPauseState::MoveCountersSelectTarget {
+                        from_id,
+                        candidates,
+                        transfers,
+                        ..
+                    } => {
+                        push_oid(&mut keep, *from_id);
+                        for &id in candidates {
+                            push_oid(&mut keep, id);
+                        }
+                        for &(id, _) in transfers {
+                            push_oid(&mut keep, id);
+                        }
+                    }
+                    StepPauseState::MoveCountersChooseAmount {
+                        from_id,
+                        candidates,
+                        target_id,
+                        transfers,
+                        ..
+                    } => {
+                        push_oid(&mut keep, *from_id);
+                        push_oid(&mut keep, *target_id);
+                        for &id in candidates {
+                            push_oid(&mut keep, id);
+                        }
+                        for &(id, _) in transfers {
                             push_oid(&mut keep, id);
                         }
                     }
@@ -3971,6 +4047,7 @@ impl GameState {
                 for &id in cont
                     .search_moved_ids
                     .iter()
+                    .chain(cont.search_candidates.iter())
                     .chain(cont.proliferate_selected_perms.iter())
                 {
                     push_oid(&mut keep, id);

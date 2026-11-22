@@ -569,7 +569,7 @@ pub(crate) fn on_event_with_granted(
         let alts = std::iter::once(&cand.trigger).chain(cand.trigger.or.iter());
         for alt in alts {
             let eff_from_zones = alt.from_zones.or(cand.trigger.from_zones);
-            if !zone_allows_trigger(&cand, alt.event, eff_from_zones, &event.kind) {
+            if !zone_allows_trigger(&cand, alt.event, &alt.filter, eff_from_zones, &event.kind) {
                 continue;
             }
             let eff_scope = alt.scope.or(cand.trigger.scope);
@@ -602,6 +602,7 @@ pub(crate) fn on_event_with_granted(
 fn zone_allows_trigger(
     cand: &TriggerCandidate,
     alt_event: EventKind,
+    alt_filter: &EventFilter,
     from_zones: Option<ZoneMask>,
     ev_kind: &crate::events::AtomicEventKind,
 ) -> bool {
@@ -625,12 +626,17 @@ fn zone_allows_trigger(
             }
         }
         Zone::Stack => {
-            from_zones.is_some_and(|m| m.contains(ZoneMask::STACK))
-                || (alt_event == EventKind::Cast
+            if let Some(m) = from_zones {
+                m.contains(ZoneMask::STACK)
+            } else {
+                alt_event == EventKind::Cast
+                    && (alt_filter.or_self
+                        || matches!(alt_filter.object, Some(TriggerSubject::SelfObj)))
                     && matches!(
                         ev_kind,
                         crate::events::AtomicEventKind::Cast { object, .. } if *object == cand.source_id
-                    ))
+                    )
+            }
         }
         Zone::Exile => {
             if from_zones.is_some_and(|m| m.contains(ZoneMask::EXILE)) {
@@ -809,9 +815,18 @@ fn collect_trigger_candidates(
         let mut stack_lki: Option<Arc<LkiSnapshot>> = None;
         for ab in active_abilities_where(state.db(), obj.card_def, &opts, |_| false) {
             if let AbilityDef::Triggered(t) = ab.ability {
+                let allows_self_stack_cast = |def: &TriggerDef, parent_from: Option<ZoneMask>| {
+                    def.event == EventKind::Cast
+                        && def.from_zones.or(parent_from).is_none()
+                        && (def.filter.or_self
+                            || matches!(def.filter.object, Some(TriggerSubject::SelfObj)))
+                };
                 let allows = trigger_or_alt_allows_zone(&t.trigger, Zone::Stack)
-                    || t.trigger.event == EventKind::Cast
-                    || t.trigger.or.iter().any(|o| o.event == EventKind::Cast);
+                    || allows_self_stack_cast(&t.trigger, None)
+                    || t.trigger
+                        .or
+                        .iter()
+                        .any(|o| allows_self_stack_cast(o, t.trigger.from_zones));
                 if allows {
                     let lki = stack_lki.get_or_insert_with(|| {
                         Arc::new(
@@ -9809,6 +9824,193 @@ mod tests {
         assert_eq!(
             state.player(PlayerId(0)).unwrap().mana_pool,
             [1, 0, 1, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn synth_cr113_6_battlefield_cast_trigger_does_not_fire_while_source_on_stack() {
+        let make_cast_trig =
+            |from_zones: Option<ZoneMask>, object: Option<TriggerSubject>, or_self: bool| {
+                AbilityDef::Triggered(TriggeredAbility {
+                    trigger: TriggerDef {
+                        event: EventKind::Cast,
+                        filter: EventFilter {
+                            object,
+                            or_self,
+                            ..Default::default()
+                        },
+                        scope: None,
+                        from_zones,
+                        only_once_per_turn: false,
+                        do_this_once_per_turn: false,
+                        is_state_trigger: false,
+                        or: vec![],
+                        chapter_numbers: SmallVec::new(),
+                        is_chapter_ability: false,
+                        spell_delayed: None,
+                    },
+                    condition: None,
+                    grant_condition: None,
+                    targets: vec![],
+                    effect: vec![gain_life_step(1)],
+                    modal: None,
+                    text: None,
+                    span: Default::default(),
+                })
+            };
+
+        // CardDefId(1): Battlefield cast watcher (`from_zones: None`, `or_self: false`, `Filter`)
+        let bf_filter_watcher = make_card(
+            "synth_bf_filter_cast",
+            "Synth Cast Watcher",
+            CardTypeMask::CREATURE,
+            vec![make_cast_trig(
+                None,
+                Some(TriggerSubject::Filter {
+                    filter: Box::new(ObjectFilter::default()),
+                }),
+                false,
+            )],
+        );
+        // CardDefId(2): Battlefield cast watcher with `object: None` (`from_zones: None`, `!or_self`)
+        let bf_none_watcher = make_card(
+            "synth_bf_none_cast",
+            "Synth Open Cast Watcher",
+            CardTypeMask::CREATURE,
+            vec![make_cast_trig(None, None, false)],
+        );
+        // CardDefId(3): On-cast self-trigger (`from_zones: None`, `SelfObj`)
+        let self_cast = make_card(
+            "synth_self_cast",
+            "Synth Self Caster",
+            CardTypeMask::CREATURE,
+            vec![make_cast_trig(None, Some(TriggerSubject::SelfObj), false)],
+        );
+        // CardDefId(4): Explicit `from_zones: Some(ZoneMask::STACK)` cast trigger
+        let stack_explicit = make_card(
+            "synth_stack_explicit",
+            "Synth Stack Explicit",
+            CardTypeMask::CREATURE,
+            vec![make_cast_trig(
+                Some(ZoneMask::STACK),
+                Some(TriggerSubject::SelfObj),
+                false,
+            )],
+        );
+        // CardDefId(5): `or_self: true` cast trigger (`from_zones: None`, `Filter + or_self`)
+        let or_self_cast = make_card(
+            "synth_or_self_cast",
+            "Synth OrSelf Caster",
+            CardTypeMask::CREATURE,
+            vec![make_cast_trig(
+                None,
+                Some(TriggerSubject::Filter {
+                    filter: Box::new(ObjectFilter::default()),
+                }),
+                true,
+            )],
+        );
+
+        let db = build_trig_db(vec![
+            bf_filter_watcher,
+            bf_none_watcher,
+            self_cast,
+            stack_explicit,
+            or_self_cast,
+        ]);
+        let mut state = setup_2p(db);
+
+        let cast_onto_stack = |state: &mut GameState, def: CardDefId| -> ObjectId {
+            let ts = state.allocate_timestamp();
+            let hand_id = state.insert_object(
+                GameObject::new(def, PlayerId(0), Zone::Hand, ts, ObjectFlags::empty()),
+                None,
+            );
+            state.player_mut(PlayerId(0)).unwrap().hand.push(hand_id);
+            let stack_id =
+                move_object_raw(state, hand_id, Zone::Stack, MoveRawOptions::default(), None)
+                    .unwrap()
+                    .new_id
+                    .unwrap();
+            let sid = state.stack_entries().last().unwrap().id;
+            emit_event(
+                state,
+                AtomicEventKind::Cast {
+                    player: PlayerId(0),
+                    object: stack_id,
+                    stack_item: sid,
+                    is_copy: false,
+                    targets: vec![],
+                    mana_spent: 0,
+                    colored_mana_spent: 0,
+                    kicked: false,
+                    from_zone: Zone::Hand,
+                },
+            );
+            stack_id
+        };
+
+        // 1. Casting `bf_filter_watcher` onto the Stack must NOT queue its own battlefield trigger.
+        let watcher_stack = cast_onto_stack(&mut state, CardDefId(1));
+        assert!(
+            state.pending_triggers().is_empty(),
+            "battlefield-only Filter cast trigger must not fire while source is on the stack"
+        );
+
+        // 2. Casting `bf_none_watcher` (`object: None`) onto the Stack must NOT queue a trigger either.
+        let _none_stack = cast_onto_stack(&mut state, CardDefId(2));
+        assert!(
+            state.pending_triggers().is_empty(),
+            "battlefield-only object:None cast trigger must not fire while source is on the stack"
+        );
+
+        // 3. Move `bf_filter_watcher` onto the Battlefield, then cast `self_cast`:
+        //    both `bf_filter_watcher` (from Battlefield) and `self_cast` (SelfObj from Stack) fire!
+        let _watcher_bf = move_object_raw(
+            &mut state,
+            watcher_stack,
+            Zone::Battlefield,
+            MoveRawOptions::default(),
+            None,
+        )
+        .unwrap()
+        .new_id
+        .unwrap();
+        let self_stack = cast_onto_stack(&mut state, CardDefId(3));
+        assert_eq!(state.pending_triggers().len(), 2);
+        let sources: Vec<ObjectId> = state.pending_triggers().iter().map(|t| t.source).collect();
+        assert!(sources.contains(&self_stack));
+        state.pending_triggers_mut().clear();
+
+        // 4. Explicit `from_zones: Some(ZoneMask::STACK)` fires for `stack_explicit` on Stack.
+        let explicit_stack = cast_onto_stack(&mut state, CardDefId(4));
+        assert_eq!(state.pending_triggers().len(), 2); // bf_filter_watcher + stack_explicit
+        assert!(
+            state
+                .pending_triggers()
+                .iter()
+                .any(|t| t.source == explicit_stack)
+        );
+        state.pending_triggers_mut().clear();
+
+        // 5. `or_self: true` fires for `or_self_cast` when it is cast itself,
+        //    but does NOT fire from the Stack when a DIFFERENT spell is cast afterward.
+        let or_self_stack = cast_onto_stack(&mut state, CardDefId(5));
+        assert!(
+            state
+                .pending_triggers()
+                .iter()
+                .any(|t| t.source == or_self_stack)
+        );
+        state.pending_triggers_mut().clear();
+
+        let _other_stack = cast_onto_stack(&mut state, CardDefId(2));
+        assert!(
+            !state
+                .pending_triggers()
+                .iter()
+                .any(|t| t.source == or_self_stack),
+            "or_self trigger on stack must only fire for its own Cast event"
         );
     }
 }

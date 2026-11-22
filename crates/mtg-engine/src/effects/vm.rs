@@ -44,6 +44,7 @@ pub(crate) const OP_TAG_PROLIFERATE_COUNTER: u8 = 17;
 pub(crate) const OP_TAG_MONSTROUS: u8 = 18;
 pub(crate) const OP_TAG_TAP_OR_UNTAP: u8 = 19;
 pub(crate) const OP_TAG_PROLIFERATE_PLAYER_COUNTER: u8 = 20;
+pub(crate) const OP_TAG_DIG: u8 = 21;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StepExecOutcome {
@@ -423,6 +424,24 @@ pub(crate) fn resolve_selection_mod(
     default_chooser: PlayerId,
     default_zone: ZoneMask,
 ) -> Result<SelectionResult, EngineError> {
+    resolve_selection_mod_ex(
+        state,
+        subject_candidates,
+        select,
+        default_chooser,
+        default_zone,
+        false,
+    )
+}
+
+pub(crate) fn resolve_selection_mod_ex(
+    state: &mut GameState,
+    subject_candidates: Vec<ObjectId>,
+    select: &SelectionMod,
+    default_chooser: PlayerId,
+    default_zone: ZoneMask,
+    pause_when_all_chosen_gt_one: bool,
+) -> Result<SelectionResult, EngineError> {
     let (candidates, chooser, choice_count) = with_vm_eval(state, |ctx, _| {
         let mut cands = if subject_candidates.is_empty() {
             if let Some(f) = select.filter.as_deref() {
@@ -509,7 +528,10 @@ pub(crate) fn resolve_selection_mod(
     if min == 0 && candidates.is_empty() {
         return Ok(SelectionResult::Ready(Vec::new()));
     }
-    if !select.up_to && candidates.len() <= usize::from(min) {
+    if !select.up_to
+        && candidates.len() <= usize::from(min)
+        && !(pause_when_all_chosen_gt_one && candidates.len() > 1)
+    {
         return Ok(SelectionResult::Ready(candidates));
     }
 
@@ -1130,6 +1152,296 @@ pub(crate) fn execute_single_step_with_op(
     Ok(outcome)
 }
 
+fn validate_vm_pause_answer(
+    pause: &StepPauseState,
+    request: &ChoiceRequest,
+    actor: PlayerId,
+    prompt_id: u32,
+    answer: &ChoiceAnswer,
+) -> Result<(), EngineError> {
+    match pause {
+        StepPauseState::GuidedResolution { controller, .. } => {
+            if actor != *controller {
+                return Err(EngineError::IllegalAction(
+                    "guided resolution actor mismatch".into(),
+                ));
+            }
+            if !matches!(answer, ChoiceAnswer::YesNo { .. }) {
+                return Err(EngineError::IllegalAction(
+                    "expected YesNo for GuidedResolution".into(),
+                ));
+            }
+        }
+        StepPauseState::OptionalChoice { chooser, purpose } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction(
+                    "optional choice actor mismatch".into(),
+                ));
+            }
+            if !matches!(answer, ChoiceAnswer::YesNo { .. }) {
+                return Err(EngineError::IllegalAction(
+                    "expected YesNo for OptionalChoice".into(),
+                ));
+            }
+            if matches!(
+                purpose,
+                YesNoPausePurpose::ScryPutBottom | YesNoPausePurpose::SurveilPutGraveyard
+            ) {
+                return Err(EngineError::IllegalAction(
+                    "scry/surveil uses ReorderLibrary pause state".into(),
+                ));
+            }
+        }
+        StepPauseState::SelectionPick {
+            chooser,
+            candidates,
+            selected,
+            min,
+            ..
+        } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction(
+                    "selection actor mismatch".into(),
+                ));
+            }
+            match answer {
+                ChoiceAnswer::PickObject { id } => {
+                    if !candidates.contains(id) || selected.contains(id) {
+                        return Err(EngineError::IllegalAction(
+                            "invalid selection candidate".into(),
+                        ));
+                    }
+                }
+                ChoiceAnswer::DonePicking => {
+                    if selected.len() < usize::from(*min) {
+                        return Err(EngineError::IllegalAction(
+                            "fewer than minimum objects picked".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(EngineError::IllegalAction(
+                        "expected PickObject or DonePicking".into(),
+                    ));
+                }
+            }
+        }
+        StepPauseState::SearchPick {
+            chooser,
+            candidates,
+            selected,
+            min,
+            destinations,
+            ..
+        } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction("search actor mismatch".into()));
+            }
+            if destinations.len() > 1 {
+                match answer {
+                    ChoiceAnswer::PickObject { id } => {
+                        if !candidates.contains(id) {
+                            return Err(EngineError::IllegalAction("invalid search pick".into()));
+                        }
+                    }
+                    ChoiceAnswer::DonePicking => {
+                        if *min > 0 {
+                            return Err(EngineError::IllegalAction(
+                                "fewer than minimum search objects picked".into(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(EngineError::IllegalAction(
+                            "expected PickObject or DonePicking for Search".into(),
+                        ));
+                    }
+                }
+            } else {
+                match answer {
+                    ChoiceAnswer::PickObject { id } => {
+                        if !candidates.contains(id) || selected.contains(id) {
+                            return Err(EngineError::IllegalAction("invalid search pick".into()));
+                        }
+                    }
+                    ChoiceAnswer::DonePicking => {
+                        if selected.len() < usize::from(*min) {
+                            return Err(EngineError::IllegalAction(
+                                "fewer than minimum search objects picked".into(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(EngineError::IllegalAction(
+                            "expected PickObject or DonePicking for Search".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        StepPauseState::ReorderLibrary {
+            player,
+            remaining,
+            deciding_card,
+            ..
+        } => {
+            if actor != *player {
+                return Err(EngineError::IllegalAction("reorder actor mismatch".into()));
+            }
+            if deciding_card.is_some() {
+                if !matches!(answer, ChoiceAnswer::YesNo { .. }) {
+                    return Err(EngineError::IllegalAction(
+                        "expected YesNo for Scry/Surveil card decision".into(),
+                    ));
+                }
+            } else {
+                let ChoiceAnswer::OrderNext { id } = answer else {
+                    return Err(EngineError::IllegalAction(
+                        "expected OrderNext for library reorder".into(),
+                    ));
+                };
+                if !remaining.contains(id) {
+                    return Err(EngineError::IllegalAction(
+                        "ordered card not in remaining set".into(),
+                    ));
+                }
+            }
+        }
+        StepPauseState::DigPick {
+            player,
+            candidates,
+            selected,
+            min,
+            ..
+        } => {
+            if actor != *player {
+                return Err(EngineError::IllegalAction("dig actor mismatch".into()));
+            }
+            match answer {
+                ChoiceAnswer::PickObject { id } => {
+                    if !candidates.contains(id) || selected.contains(id) {
+                        return Err(EngineError::IllegalAction("invalid dig pick".into()));
+                    }
+                }
+                ChoiceAnswer::DonePicking => {
+                    if selected.len() < usize::from(*min) {
+                        return Err(EngineError::IllegalAction(
+                            "fewer than minimum dig cards picked".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(EngineError::IllegalAction(
+                        "expected PickObject or DonePicking for Dig".into(),
+                    ));
+                }
+            }
+        }
+        StepPauseState::ChooseNumber { chooser, .. } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction("number chooser mismatch".into()));
+            }
+            let ChoiceAnswer::PickNumber { value } = answer else {
+                return Err(EngineError::IllegalAction("expected PickNumber".into()));
+            };
+            let ChoiceRequest::ChooseNumber { min, max, .. } = request else {
+                return Err(EngineError::IllegalAction(
+                    "corrupted request shape for ChooseNumber".into(),
+                ));
+            };
+            if value < min || value > max {
+                return Err(EngineError::IllegalAction(format!(
+                    "number {value} outside {min}..={max}"
+                )));
+            }
+        }
+        StepPauseState::ChooseMode {
+            chooser,
+            options,
+            picked,
+            allow_duplicates,
+            min,
+            ..
+        } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction("mode chooser mismatch".into()));
+            }
+            match answer {
+                ChoiceAnswer::PickMode { index } => {
+                    if usize::from(*index) >= options.len()
+                        || (!*allow_duplicates && picked.contains(index))
+                    {
+                        return Err(EngineError::IllegalAction("invalid mode index".into()));
+                    }
+                }
+                ChoiceAnswer::DonePicking => {
+                    if picked.len() < usize::from(*min) {
+                        return Err(EngineError::IllegalAction(
+                            "fewer than minimum modes picked".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(EngineError::IllegalAction(
+                        "expected PickMode or DonePicking".into(),
+                    ));
+                }
+            }
+        }
+        StepPauseState::MoveCountersSelectTarget {
+            chooser,
+            candidates,
+            ..
+        } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction(
+                    "move counters target actor mismatch".into(),
+                ));
+            }
+            match answer {
+                ChoiceAnswer::PickObject { id } => {
+                    if !candidates.contains(id) {
+                        return Err(EngineError::IllegalAction(
+                            "invalid move counters target".into(),
+                        ));
+                    }
+                }
+                ChoiceAnswer::DonePicking => {}
+                _ => {
+                    return Err(EngineError::IllegalAction(
+                        "expected PickObject or DonePicking for MoveCounters".into(),
+                    ));
+                }
+            }
+        }
+        StepPauseState::MoveCountersChooseAmount {
+            chooser, remaining, ..
+        } => {
+            if actor != *chooser {
+                return Err(EngineError::IllegalAction(
+                    "move counters amount actor mismatch".into(),
+                ));
+            }
+            let ChoiceAnswer::PickNumber { value } = answer else {
+                return Err(EngineError::IllegalAction(
+                    "expected PickNumber for MoveCounters".into(),
+                ));
+            };
+            if *value < 1 || (*value as u32) > *remaining {
+                return Err(EngineError::IllegalAction(format!(
+                    "move counters amount {value} outside 1..={remaining}"
+                )));
+            }
+        }
+        StepPauseState::WaitingOnReplacement { .. } => {
+            return Err(EngineError::IllegalAction(format!(
+                "prompt {prompt_id} is waiting on replacement, not direct choice"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Completes a paused `ChoiceRequest` once an answer is received.
 pub(crate) fn handle_vm_pause_answer(
     state: &mut GameState,
@@ -1138,6 +1450,33 @@ pub(crate) fn handle_vm_pause_answer(
     answer: ChoiceAnswer,
     dispatch_op: fn(&mut GameState, &EffectStep) -> Result<StepExecOutcome, EngineError>,
 ) -> Result<Option<StepExecOutcome>, EngineError> {
+    let pause_ref = state
+        .resolution_vms()
+        .last()
+        .and_then(|vm| vm.pause_state.as_ref())
+        .ok_or_else(|| EngineError::IllegalAction("no active resolution pause state".into()))?;
+    if matches!(pause_ref, StepPauseState::WaitingOnReplacement { .. }) {
+        return Err(EngineError::IllegalAction(format!(
+            "prompt {prompt_id} is waiting on replacement, not direct choice"
+        )));
+    }
+    let Some(pp) = state.pending_prompt() else {
+        return Err(EngineError::IllegalAction(
+            "no active resolution prompt".into(),
+        ));
+    };
+    if pp.chooser != actor || pp.prompt_id != prompt_id {
+        return Err(EngineError::IllegalAction(
+            "resolution prompt actor or prompt_id mismatch".into(),
+        ));
+    }
+    if !matches!(pp.owner, PromptOwner::ResolutionFrame) {
+        return Err(EngineError::IllegalAction(
+            "pending prompt is not owned by resolution frame".into(),
+        ));
+    }
+    validate_vm_pause_answer(pause_ref, &pp.request, actor, prompt_id, &answer)?;
+
     let pause = state
         .resolution_vms_mut()
         .last_mut()
@@ -1146,6 +1485,9 @@ pub(crate) fn handle_vm_pause_answer(
     state.take_pending_prompt();
     if let Some(fr) = state.resolution_frames_mut().last_mut() {
         fr.pending_prompt_id = None;
+    }
+    if matches!(state.decision(), DecisionState::Prompt { .. }) {
+        state.set_decision(DecisionState::Priority);
     }
 
     match pause {
@@ -1330,12 +1672,65 @@ pub(crate) fn handle_vm_pause_answer(
             min,
             max,
             destinations,
+            dest_idx,
+            moved_ids,
             shuffle_library,
             reveal,
             tapped,
         } => {
             if actor != chooser {
                 return Err(EngineError::IllegalAction("search actor mismatch".into()));
+            }
+            if destinations.len() > 1 {
+                let step = current_step_cloned(state)
+                    .ok_or_else(|| EngineError::IllegalAction("missing step".into()))?;
+                let outcome = match answer {
+                    ChoiceAnswer::PickObject { id } => {
+                        if !candidates.contains(&id) {
+                            return Err(EngineError::IllegalAction("invalid search pick".into()));
+                        }
+                        super::library_hand::advance_multi_dest_search(
+                            state,
+                            &step,
+                            chooser,
+                            searched_player,
+                            candidates,
+                            destinations,
+                            dest_idx,
+                            moved_ids,
+                            shuffle_library,
+                            reveal,
+                            id,
+                        )?
+                    }
+                    ChoiceAnswer::DonePicking => {
+                        if min > 0 {
+                            return Err(EngineError::IllegalAction(
+                                "fewer than minimum search objects picked".into(),
+                            ));
+                        }
+                        super::library_hand::finish_multi_dest_search(
+                            state,
+                            &step,
+                            searched_player,
+                            moved_ids,
+                            shuffle_library,
+                        )?
+                    }
+                    _ => {
+                        return Err(EngineError::IllegalAction(
+                            "expected PickObject or DonePicking for Search".into(),
+                        ));
+                    }
+                };
+                return match outcome {
+                    StepExecOutcome::Done => {
+                        finish_accepted_step(state, &step);
+                        advance_active_pc(state);
+                        Ok(None)
+                    }
+                    other => Ok(Some(other)),
+                };
             }
             match answer {
                 ChoiceAnswer::PickObject { id } => {
@@ -1354,6 +1749,8 @@ pub(crate) fn handle_vm_pause_answer(
                                 min,
                                 max,
                                 destinations,
+                                dest_idx,
+                                moved_ids,
                                 shuffle_library,
                                 reveal,
                                 tapped,
@@ -1458,6 +1855,7 @@ pub(crate) fn handle_vm_pause_answer(
             mut selected,
             min,
             max,
+            partition_picks,
         } => {
             if actor != player {
                 return Err(EngineError::IllegalAction("dig actor mismatch".into()));
@@ -1478,6 +1876,7 @@ pub(crate) fn handle_vm_pause_answer(
                                 selected,
                                 min,
                                 max,
+                                partition_picks,
                             });
                         }
                         if let Some(fr) = state.resolution_frames_mut().last_mut() {
@@ -1496,6 +1895,7 @@ pub(crate) fn handle_vm_pause_answer(
                             owner: PromptOwner::ResolutionFrame,
                         }));
                         state.set_decision(DecisionState::Prompt { request: req });
+                        state.set_priority_player(player);
                         return Ok(Some(StepExecOutcome::Paused {
                             prompt_id: next_pid,
                             chooser: player,
@@ -1517,8 +1917,24 @@ pub(crate) fn handle_vm_pause_answer(
             }
             let step = current_step_cloned(state)
                 .ok_or_else(|| EngineError::IllegalAction("missing step".into()))?;
-            let outcome =
-                super::library_hand::finalize_dig_picks(state, &step, player, revealed, selected)?;
+            let outcome = if let mtg_ir::EffectOp::Dig { spec, .. } = &step.op
+                && !spec.partitions.is_empty()
+            {
+                let picked_id = selected.into_iter().next().ok_or_else(|| {
+                    EngineError::IllegalAction("expected picked card for Dig partition".into())
+                })?;
+                super::library_hand::advance_dig_partitions(
+                    state,
+                    &step,
+                    player,
+                    spec,
+                    revealed,
+                    partition_picks,
+                    picked_id,
+                )?
+            } else {
+                super::library_hand::finalize_dig_picks(state, &step, player, revealed, selected)?
+            };
             match outcome {
                 StepExecOutcome::Done => {
                     finish_accepted_step(state, &step);
@@ -1632,6 +2048,160 @@ pub(crate) fn handle_vm_pause_answer(
                 other => Ok(Some(other)),
             }
         }
+        StepPauseState::MoveCountersSelectTarget {
+            chooser,
+            from_id,
+            counter,
+            candidates,
+            remaining,
+            transfers,
+        } => {
+            if actor != chooser {
+                return Err(EngineError::IllegalAction(
+                    "move counters target actor mismatch".into(),
+                ));
+            }
+            match answer {
+                ChoiceAnswer::PickObject { id } => {
+                    if !candidates.contains(&id) {
+                        return Err(EngineError::IllegalAction(
+                            "invalid move counters target".into(),
+                        ));
+                    }
+                    let next_pid = state.allocate_prompt_id();
+                    if let Some(vm) = state.resolution_vms_mut().last_mut() {
+                        vm.pause_state = Some(StepPauseState::MoveCountersChooseAmount {
+                            chooser,
+                            from_id,
+                            counter,
+                            candidates,
+                            target_id: id,
+                            remaining,
+                            transfers,
+                        });
+                    }
+                    if let Some(fr) = state.resolution_frames_mut().last_mut() {
+                        fr.pending_prompt_id = Some(next_pid);
+                    }
+                    let req = ChoiceRequest::ChooseNumber {
+                        prompt_id: next_pid,
+                        min: 1,
+                        max: remaining.min(i32::MAX as u32) as i32,
+                    };
+                    state.set_pending_prompt(Some(PendingPromptContext {
+                        prompt_id: next_pid,
+                        chooser,
+                        request: req.clone(),
+                        owner: PromptOwner::ResolutionFrame,
+                    }));
+                    state.set_decision(DecisionState::Prompt { request: req });
+                    state.set_priority_player(chooser);
+                    Ok(Some(StepExecOutcome::Paused {
+                        prompt_id: next_pid,
+                        chooser,
+                    }))
+                }
+                ChoiceAnswer::DonePicking => {
+                    let step = current_step_cloned(state)
+                        .ok_or_else(|| EngineError::IllegalAction("missing step".into()))?;
+                    let outcome = super::counters_mods::finalize_interactive_move_counters(
+                        state, chooser, from_id, counter, transfers,
+                    )?;
+                    match outcome {
+                        StepExecOutcome::Done => {
+                            finish_accepted_step(state, &step);
+                            advance_active_pc(state);
+                            Ok(None)
+                        }
+                        other => Ok(Some(other)),
+                    }
+                }
+                _ => Err(EngineError::IllegalAction(
+                    "expected PickObject or DonePicking for MoveCounters".into(),
+                )),
+            }
+        }
+        StepPauseState::MoveCountersChooseAmount {
+            chooser,
+            from_id,
+            counter,
+            mut candidates,
+            target_id,
+            remaining,
+            mut transfers,
+        } => {
+            if actor != chooser {
+                return Err(EngineError::IllegalAction(
+                    "move counters amount actor mismatch".into(),
+                ));
+            }
+            let ChoiceAnswer::PickNumber { value } = answer else {
+                return Err(EngineError::IllegalAction(
+                    "expected PickNumber for MoveCounters".into(),
+                ));
+            };
+            if value < 1 || (value as u32) > remaining {
+                return Err(EngineError::IllegalAction(format!(
+                    "move counters amount {value} outside 1..={remaining}"
+                )));
+            }
+            let chosen = value as u32;
+            transfers.push((target_id, chosen));
+            let new_remaining = remaining - chosen;
+            candidates.retain(|&id| {
+                id != from_id
+                    && state
+                        .object(id)
+                        .is_some_and(|o| o.zone == Zone::Battlefield && !o.is_phased_out())
+            });
+            if new_remaining > 0 && !candidates.is_empty() {
+                let next_pid = state.allocate_prompt_id();
+                if let Some(vm) = state.resolution_vms_mut().last_mut() {
+                    vm.pause_state = Some(StepPauseState::MoveCountersSelectTarget {
+                        chooser,
+                        from_id,
+                        counter,
+                        candidates: candidates.clone(),
+                        remaining: new_remaining,
+                        transfers,
+                    });
+                }
+                if let Some(fr) = state.resolution_frames_mut().last_mut() {
+                    fr.pending_prompt_id = Some(next_pid);
+                }
+                let req = ChoiceRequest::ChooseObjects {
+                    prompt_id: next_pid,
+                    candidates,
+                    min: 0,
+                    max: 1,
+                };
+                state.set_pending_prompt(Some(PendingPromptContext {
+                    prompt_id: next_pid,
+                    chooser,
+                    request: req.clone(),
+                    owner: PromptOwner::ResolutionFrame,
+                }));
+                state.set_decision(DecisionState::Prompt { request: req });
+                state.set_priority_player(chooser);
+                return Ok(Some(StepExecOutcome::Paused {
+                    prompt_id: next_pid,
+                    chooser,
+                }));
+            }
+            let step = current_step_cloned(state)
+                .ok_or_else(|| EngineError::IllegalAction("missing step".into()))?;
+            let outcome = super::counters_mods::finalize_interactive_move_counters(
+                state, chooser, from_id, counter, transfers,
+            )?;
+            match outcome {
+                StepExecOutcome::Done => {
+                    finish_accepted_step(state, &step);
+                    advance_active_pc(state);
+                    Ok(None)
+                }
+                other => Ok(Some(other)),
+            }
+        }
         StepPauseState::WaitingOnReplacement { .. } => Err(EngineError::IllegalAction(format!(
             "prompt {prompt_id} is waiting on replacement, not direct choice"
         ))),
@@ -1670,6 +2240,22 @@ pub(crate) fn handle_replacement_resume(
             Ok(Some(StepExecOutcome::Paused { prompt_id, chooser }))
         }
         crate::choices::ReplacementResumeOutcome::ZoneMove(mv) => {
+            if op_tag == OP_TAG_DIG {
+                let res = super::library_hand::resume_dig_after_replacement(
+                    state,
+                    &step,
+                    mv,
+                    &batch_remaining,
+                    batch_idx,
+                )?;
+                if !matches!(res, StepExecOutcome::Done) {
+                    return Ok(Some(res));
+                }
+                finish_accepted_step(state, &step);
+                advance_active_pc(state);
+                let _ = dispatch_op;
+                return Ok(None);
+            }
             let bind_as = step.bind_as.as_deref();
             let moved_raw = if let MoveObjectOutcome::Moved(ref r) = mv {
                 Some(r.clone())
@@ -1704,19 +2290,34 @@ pub(crate) fn handle_replacement_resume(
                     cont.search_moved_ids.push(raw.new_id.unwrap_or(raw.old_id));
                 }
                 let fallback_actor = resolve_step_actor(state, &step);
-                let res = super::library_hand::finalize_search_picks_from(
-                    state,
-                    &step,
-                    cont.search_chooser.unwrap_or(fallback_actor),
-                    cont.search_searched_player.unwrap_or(fallback_actor),
-                    &batch_remaining,
-                    batch_idx + 1,
-                    &cont.search_destinations,
-                    cont.search_shuffle,
-                    cont.search_reveal,
-                    cont.search_tapped,
-                    cont.search_moved_ids,
-                )?;
+                let res = if cont.search_destinations.len() > 1 {
+                    super::library_hand::continue_or_finish_multi_dest_search(
+                        state,
+                        &step,
+                        cont.search_chooser.unwrap_or(fallback_actor),
+                        cont.search_searched_player.unwrap_or(fallback_actor),
+                        cont.search_candidates,
+                        cont.search_destinations,
+                        cont.search_dest_idx + 1,
+                        cont.search_moved_ids,
+                        cont.search_shuffle,
+                        cont.search_reveal,
+                    )?
+                } else {
+                    super::library_hand::finalize_search_picks_from(
+                        state,
+                        &step,
+                        cont.search_chooser.unwrap_or(fallback_actor),
+                        cont.search_searched_player.unwrap_or(fallback_actor),
+                        &batch_remaining,
+                        batch_idx + 1,
+                        &cont.search_destinations,
+                        cont.search_shuffle,
+                        cont.search_reveal,
+                        cont.search_tapped,
+                        cont.search_moved_ids,
+                    )?
+                };
                 if !matches!(res, StepExecOutcome::Done) {
                     return Ok(Some(res));
                 }
@@ -1877,6 +2478,12 @@ pub(crate) fn active_legal_actions(state: &GameState, player: PlayerId) -> Vec<A
                         answer: ChoiceAnswer::PickNumber {
                             value: (*min as i64 + off) as i32,
                         },
+                    });
+                }
+                if i64::from(*max) >= i64::from(*min) + 64 {
+                    actions.push(Action::Answer {
+                        prompt_id: *prompt_id,
+                        answer: ChoiceAnswer::PickNumber { value: *max },
                     });
                 }
             }

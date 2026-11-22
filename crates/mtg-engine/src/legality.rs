@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use mtg_ir::{
     AbilityDef, ActivationRestriction, Affected, CardDefId, CardLayout, CardTypeMask, ColorMask,
     CostDef, FaceDef, GamePhase, KeywordDef, LoyaltySign, ManaColor, ManaCost, ManaPip, RuleMod,
@@ -22,6 +24,7 @@ use crate::faces::{
 };
 use crate::filter::matches_object_filter;
 use crate::id::{ObjectId, PlayerId};
+use crate::keywords::{keyword_activated_zones, synthesize_keyword_activated_ability};
 use crate::layers::predicates::GrantedAbilityEntry;
 use crate::mana::{
     ManaAbilityCandidate, ManaSpendContext, ManaSpendContextKind,
@@ -40,7 +43,7 @@ use crate::targets::{
 #[derive(Debug, Clone)]
 pub struct ResolvedActivatedAbility<'a> {
     pub ability_index: u16,
-    pub ability: &'a mtg_ir::ActivatedAbility,
+    pub ability: Cow<'a, mtg_ir::ActivatedAbility>,
     pub source_card_def: CardDefId,
     pub face_index: u8,
     pub mana_as_any_color: bool,
@@ -1944,12 +1947,6 @@ pub(crate) fn resolve_activated_abilities_cached<'a>(
             let innate_abilities: Vec<ActiveAbilityWithCardRef<'a>> =
                 active_abilities_with_card_for_object(state, object, &ctx);
             for ab_ref in innate_abilities {
-                let AbilityDef::Activated(act) = ab_ref.ability else {
-                    continue;
-                };
-                if act.is_mana || act.timing == Timing::Mana {
-                    continue;
-                }
                 let base_offset = if ab_ref.component_index == 0 {
                     primary_face_offsets
                         .iter()
@@ -1962,16 +1959,34 @@ pub(crate) fn resolve_activated_abilities_cached<'a>(
                         .map_or(0, |(_, off)| *off)
                 };
                 let shared_idx = base_offset.saturating_add(ab_ref.ability_index);
-                if let Ok(ability_index) = u16::try_from(shared_idx) {
-                    out.push(ResolvedActivatedAbility {
-                        ability_index,
-                        ability: act,
-                        source_card_def: ab_ref.card_def,
-                        face_index: ab_ref.face_index,
-                        mana_as_any_color: false,
-                        grant_once_each_turn: false,
-                    });
-                }
+                let Ok(ability_index) = u16::try_from(shared_idx) else {
+                    continue;
+                };
+                let ability = match ab_ref.ability {
+                    AbilityDef::Activated(act) => {
+                        if act.is_mana || act.timing == Timing::Mana {
+                            continue;
+                        }
+                        Cow::Borrowed(act)
+                    }
+                    AbilityDef::Keyword(kw_ab) => {
+                        let Some(synth) =
+                            synthesize_keyword_activated_ability(state.db(), kw_ab, shared_idx)
+                        else {
+                            continue;
+                        };
+                        Cow::Owned(synth)
+                    }
+                    _ => continue,
+                };
+                out.push(ResolvedActivatedAbility {
+                    ability_index,
+                    ability,
+                    source_card_def: ab_ref.card_def,
+                    face_index: ab_ref.face_index,
+                    mana_as_any_color: false,
+                    grant_once_each_turn: false,
+                });
             }
         }
     }
@@ -1997,13 +2012,30 @@ pub(crate) fn resolve_activated_abilities_cached<'a>(
                     }
                     if let Some(card) = state.db().get(*card_def)
                         && let Some(face) = card.faces.get(usize::from(*face_index))
-                        && let Some(AbilityDef::Activated(act)) = face.abilities.get(*src_idx)
-                        && !act.is_mana
-                        && act.timing != Timing::Mana
+                        && let Some(ab) = face.abilities.get(*src_idx)
                     {
+                        let ability = match ab {
+                            AbilityDef::Activated(act) => {
+                                if act.is_mana || act.timing == Timing::Mana {
+                                    continue;
+                                }
+                                Cow::Borrowed(act)
+                            }
+                            AbilityDef::Keyword(kw_ab) => {
+                                let Some(synth) = synthesize_keyword_activated_ability(
+                                    state.db(),
+                                    kw_ab,
+                                    *src_idx,
+                                ) else {
+                                    continue;
+                                };
+                                Cow::Owned(synth)
+                            }
+                            _ => continue,
+                        };
                         out.push(ResolvedActivatedAbility {
                             ability_index,
-                            ability: act,
+                            ability,
                             source_card_def: *card_def,
                             face_index: *face_index,
                             mana_as_any_color: *mana_as_any_color,
@@ -2021,19 +2053,31 @@ pub(crate) fn resolve_activated_abilities_cached<'a>(
                     if *is_mana {
                         continue;
                     }
-                    if let AbilityDef::Activated(act) = ability.as_ref()
-                        && !act.is_mana
-                        && act.timing != Timing::Mana
-                    {
-                        out.push(ResolvedActivatedAbility {
-                            ability_index,
-                            ability: act,
-                            source_card_def: grant_card_def.unwrap_or(obj.card_def),
-                            face_index: *source_face_index,
-                            mana_as_any_color: false,
-                            grant_once_each_turn: false,
-                        });
-                    }
+                    let resolved = match ability.as_ref() {
+                        AbilityDef::Activated(act) => {
+                            if act.is_mana || act.timing == Timing::Mana {
+                                continue;
+                            }
+                            Cow::Borrowed(act)
+                        }
+                        AbilityDef::Keyword(kw_ab) => {
+                            let Some(synth) =
+                                synthesize_keyword_activated_ability(state.db(), kw_ab, gi)
+                            else {
+                                continue;
+                            };
+                            Cow::Owned(synth)
+                        }
+                        _ => continue,
+                    };
+                    out.push(ResolvedActivatedAbility {
+                        ability_index,
+                        ability: resolved,
+                        source_card_def: grant_card_def.unwrap_or(obj.card_def),
+                        face_index: *source_face_index,
+                        mana_as_any_color: false,
+                        grant_once_each_turn: false,
+                    });
                 }
                 GrantedAbilityEntry::IntrinsicBasicMana { .. }
                 | GrantedAbilityEntry::DynamicWard { .. } => {}
@@ -2177,7 +2221,7 @@ pub(crate) fn can_activate_ability_cached<'a>(
     let res = resolved_list
         .into_iter()
         .find(|r| r.ability_index == ability_index)?;
-    let act = res.ability;
+    let act = res.ability.as_ref();
 
     let zones = if act.activation_zones.is_empty() {
         ZoneMask::BATTLEFIELD
@@ -2771,6 +2815,7 @@ fn might_have_non_mana_activated_ability(
     if obj.zone == Zone::Battlefield && obj.is_phased_out() {
         return false;
     }
+    let zm = ZoneMask::from_zone(obj.zone);
     let extras = cache.extra(oid);
     if extras.is_some_and(|e| {
         e.granted_abilities.iter().any(|g| match g {
@@ -2779,10 +2824,12 @@ fn might_have_non_mana_activated_ability(
                 is_mana, ability, ..
             } => {
                 !*is_mana
-                    && matches!(
-                        ability.as_ref(),
-                        AbilityDef::Activated(act) if !act.is_mana && act.timing != Timing::Mana
-                    )
+                    && match ability.as_ref() {
+                        AbilityDef::Activated(act) => !act.is_mana && act.timing != Timing::Mana,
+                        AbilityDef::Keyword(kw_ab) => keyword_activated_zones(state.db(), kw_ab)
+                            .is_some_and(|az| az.intersects(zm)),
+                        _ => false,
+                    }
             }
             GrantedAbilityEntry::IntrinsicBasicMana { .. }
             | GrantedAbilityEntry::DynamicWard { .. } => false,
@@ -2801,23 +2848,21 @@ fn might_have_non_mana_activated_ability(
     {
         return true;
     }
-    let zm = ZoneMask::from_zone(obj.zone);
     state.db().get(obj.card_def).is_some_and(|card| {
         card.faces.iter().any(|f| {
-            f.abilities.iter().any(|ab| {
-                if let AbilityDef::Activated(act) = ab
-                    && !act.is_mana
-                    && act.timing != Timing::Mana
-                {
+            f.abilities.iter().any(|ab| match ab {
+                AbilityDef::Activated(act) if !act.is_mana && act.timing != Timing::Mana => {
                     let act_zones = if act.activation_zones.is_empty() {
                         ZoneMask::BATTLEFIELD
                     } else {
                         act.activation_zones
                     };
                     act_zones.intersects(zm)
-                } else {
-                    false
                 }
+                AbilityDef::Keyword(kw_ab) => {
+                    keyword_activated_zones(state.db(), kw_ab).is_some_and(|az| az.intersects(zm))
+                }
+                _ => false,
             })
         })
     })

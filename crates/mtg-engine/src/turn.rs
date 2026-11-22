@@ -154,13 +154,16 @@ pub fn apply_mulligan_action(
                     "cannot take another mulligan".into(),
                 ));
             }
+            // Insert hand cards at bottom (index 0) in hand order so `shuffle_library`'s
+            // pre-shuffle reverse feeds `[L_0..L_{k-1}, H_0..H_{m-1}]` to `Mulberry32`
+            // Fisher-Yates, matching TS `mulliganRedraw` (`zones.ts:4725-4734`).
             for oid in hand_ids {
                 let _ = move_object_raw(
                     state,
                     oid,
                     Zone::Library,
                     MoveRawOptions {
-                        position: ZonePosition::Top,
+                        position: ZonePosition::Bottom,
                         ..Default::default()
                     },
                     None,
@@ -201,9 +204,6 @@ pub fn apply_mulligan_action(
             }
             state.set_mulligan_bottom_remaining(player, to_bottom);
             state.mark_dirty(DirtyMask::PLAYER_STATE);
-            if to_bottom > 0 {
-                return Ok(false);
-            }
             advance_mulligan_or_start_turn_one(state)
         }
         Action::BottomCard { object } => {
@@ -298,11 +298,24 @@ fn advance_mulligan_or_start_turn_one(state: &mut GameState) -> Result<bool, Eng
 fn find_next_mulligan_player(state: &GameState) -> Option<PlayerId> {
     let n = state.players().len();
     let cur = usize::from(state.priority_player().0);
+    // CR 103.5 Stage 1: every active player keeps or mulligans before anyone bottoms cards.
     for offset in 1..=n {
         let pid = PlayerId(((cur + offset) % n) as u8);
         if let Some(p) = state.player(pid)
             && !p.lost
-            && (!p.has_kept_hand || state.mulligan_bottom_remaining(pid) > 0)
+            && !p.has_kept_hand
+        {
+            return Some(pid);
+        }
+    }
+    // CR 103.5 Stage 2: starting with the starting player and proceeding in turn order,
+    // each player who took at least one mulligan puts cards on the bottom.
+    let start = usize::from(state.active_player().0);
+    for offset in 0..n {
+        let pid = PlayerId(((start + offset) % n) as u8);
+        if let Some(p) = state.player(pid)
+            && !p.lost
+            && state.mulligan_bottom_remaining(pid) > 0
         {
             return Some(pid);
         }
@@ -656,23 +669,65 @@ pub fn resume_turn_prompt(
     prompt_id: u32,
     answer: ChoiceAnswer,
 ) -> Result<TurnAdvanceOutcome, EngineError> {
-    let Some(pp) = state.take_pending_prompt() else {
+    let Some(pp) = state.pending_prompt() else {
         return Err(EngineError::IllegalAction(
             "no pending turn prompt to resume".into(),
         ));
     };
     if pp.chooser != actor || pp.prompt_id != prompt_id {
-        state.set_pending_prompt(Some(pp));
         return Err(EngineError::IllegalAction(
             "turn prompt actor or prompt_id mismatch".into(),
         ));
     }
+    let PromptOwner::Turn(ref kind) = pp.owner else {
+        return Err(EngineError::IllegalAction(
+            "pending prompt is not owned by turn".into(),
+        ));
+    };
+
+    match kind {
+        TurnPromptKind::CleanupDiscard { .. } => {
+            let ChoiceAnswer::PickObject { id } = answer else {
+                return Err(EngineError::IllegalAction(
+                    "expected PickObject for CleanupDiscard".into(),
+                ));
+            };
+            if !state.player(actor).is_some_and(|p| p.hand.contains(&id)) {
+                return Err(EngineError::IllegalAction(
+                    "chosen discard card is not in hand".into(),
+                ));
+            }
+        }
+        TurnPromptKind::UntapOptional { .. } => {
+            if !matches!(answer, ChoiceAnswer::YesNo { .. }) {
+                return Err(EngineError::IllegalAction(
+                    "expected YesNo for UntapOptional".into(),
+                ));
+            }
+        }
+        TurnPromptKind::EndTurnMay => {
+            if !matches!(answer, ChoiceAnswer::YesNo { .. }) {
+                return Err(EngineError::IllegalAction(
+                    "expected YesNo for EndTurnMay".into(),
+                ));
+            }
+        }
+    }
+
+    let Some(pp) = state.take_pending_prompt() else {
+        return Err(EngineError::IllegalAction(
+            "no pending turn prompt to resume".into(),
+        ));
+    };
     let PromptOwner::Turn(kind) = pp.owner else {
         state.set_pending_prompt(Some(pp));
         return Err(EngineError::IllegalAction(
             "pending prompt is not owned by turn".into(),
         ));
     };
+    if matches!(state.decision(), DecisionState::Prompt { .. }) {
+        state.set_decision(DecisionState::Priority);
+    }
 
     match kind {
         TurnPromptKind::CleanupDiscard { remaining, picked } => {
@@ -682,11 +737,6 @@ pub fn resume_turn_prompt(
                 ));
             };
             let _ = picked;
-            if !state.player(actor).is_some_and(|p| p.hand.contains(&id)) {
-                return Err(EngineError::IllegalAction(
-                    "chosen discard card is not in hand".into(),
-                ));
-            }
             let next_rem = remaining.saturating_sub(1);
             match move_object(
                 state,
@@ -830,6 +880,9 @@ pub fn end_the_turn_immediately(
     state.set_pending_replacement(None);
     state.set_pending_trigger_order(None);
     state.set_pending_replacement_resume(None);
+    if matches!(state.decision(), DecisionState::Prompt { .. }) {
+        state.set_decision(DecisionState::Priority);
+    }
     state.clear_passed_priority();
 
     for oid in stack_objs {
@@ -856,6 +909,9 @@ pub fn grant_priority_with_sba_and_triggers(
 ) -> Result<TurnAdvanceOutcome, EngineError> {
     if let Some(paused) = check_paused_or_gameover(state) {
         return Ok(paused);
+    }
+    if matches!(state.decision(), DecisionState::Prompt { .. }) {
+        state.set_decision(DecisionState::Priority);
     }
     match check_sbas(state)? {
         SbaOutcome::Done => {}
@@ -1838,7 +1894,7 @@ fn expire_end_of_next_turn_effects_for(state: &mut GameState, active: PlayerId) 
     });
     restore_timed_copiable_backups(state, |b| {
         if b.duration == Duration::UntilEndOfYourNextTurn {
-            return b.expires_on_player.is_none_or(|p| p == active)
+            return b.expires_on_player == Some(active)
                 && b.expires_turn.is_none_or(|min_t| cur_turn >= min_t);
         }
         false
@@ -1879,7 +1935,7 @@ fn expire_until_next_turn_effects_for(state: &mut GameState, active: PlayerId) {
     });
     restore_timed_copiable_backups(state, |b| {
         if b.duration == Duration::UntilYourNextTurn {
-            return b.expires_on_player.is_none_or(|p| p == active)
+            return b.expires_on_player == Some(active)
                 && b.expires_turn.is_none_or(|min_t| cur_turn >= min_t);
         }
         false
@@ -2216,15 +2272,20 @@ mod tests {
         assert_eq!(state.decision(), &DecisionState::Mulligan);
         assert_eq!(state.priority_player(), PlayerId(0));
 
-        // P0 mulligans once (free first) and once again (needs 1 bottom), then keeps.
+        // P0 mulligans once (free first) and once again (needs 1 bottom), then keeps -> P1 decides.
         assert!(!apply_mulligan_action(&mut state, PlayerId(0), &Action::TakeMulligan).unwrap());
         assert!(!apply_mulligan_action(&mut state, PlayerId(0), &Action::TakeMulligan).unwrap());
         assert!(!apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap());
         assert_eq!(state.mulligan_bottom_remaining(PlayerId(0)), 1);
+        assert_eq!(state.priority_player(), PlayerId(1));
+
+        // P1 keeps without mulliganing -> Stage 2 returns to P0 for bottoming.
+        assert!(!apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap());
+        assert_eq!(state.priority_player(), PlayerId(0));
 
         let bottom_card = state.player(PlayerId(0)).unwrap().hand[0];
         assert!(
-            !apply_mulligan_action(
+            apply_mulligan_action(
                 &mut state,
                 PlayerId(0),
                 &Action::BottomCard {
@@ -2235,10 +2296,6 @@ mod tests {
         );
         assert_eq!(state.mulligan_bottom_remaining(PlayerId(0)), 0);
         assert_eq!(state.player(PlayerId(0)).unwrap().hand.len(), 6);
-        assert_eq!(state.priority_player(), PlayerId(1));
-
-        // P1 keeps without mulliganing -> Turn 1 Main1 starts.
-        assert!(apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap());
         assert_eq!(state.phase(), GamePhase::Main1);
         assert_eq!(state.decision(), &DecisionState::Priority);
         assert_eq!(state.active_player(), PlayerId(0));
@@ -3038,5 +3095,1196 @@ mod tests {
                 .power,
             1
         );
+    }
+
+    fn synth_gain_life_step(n: i32) -> mtg_ir::EffectStep {
+        mtg_ir::EffectStep {
+            op: mtg_ir::EffectOp::GainLife {
+                set_life_total: false,
+            },
+            subject: mtg_ir::Selector::PlayerRef {
+                player: mtg_ir::PlayerRef::You,
+            },
+            actor: None,
+            amount: Some(Box::new(mtg_ir::Amount::Const { n })),
+            optional: None,
+            gate: None,
+            bind_as: None,
+            do_this_once_per_turn: false,
+            reflexive_trigger: None,
+            span: Default::default(),
+        }
+    }
+
+    fn synth_put_card_on_bf(state: &mut GameState, owner: PlayerId, def: CardDefId) -> ObjectId {
+        let ts = state.allocate_timestamp();
+        let oid = state.insert_object(
+            crate::state::GameObject::new(def, owner, Zone::Hand, ts, ObjectFlags::empty()),
+            None,
+        );
+        state.player_mut(owner).unwrap().hand.push(oid);
+        let moved = move_object_raw(
+            state,
+            oid,
+            Zone::Battlefield,
+            MoveRawOptions::default(),
+            None,
+        )
+        .unwrap();
+        moved.new_id.unwrap_or(oid)
+    }
+
+    #[test]
+    fn synth_cr503_1a_cleanup_discard_flushes_upkeep_trigger_in_upkeep() {
+        let mut tables = InternTables::default();
+        tables.counters.push("stun".into());
+        tables.counters.push("lore".into());
+
+        let plains = CardDef {
+            oracle_id: "synth_cr503_plains".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth CR503 Plains".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth CR503 Plains".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::LAND,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::BASIC,
+                    colors: ColorMask::empty(),
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let upkeep_relic = CardDef {
+            oracle_id: "synth_cr503_upkeep_relic".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Upkeep Relic".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Upkeep Relic".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::ENCHANTMENT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::W,
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![AbilityDef::Triggered(mtg_ir::TriggeredAbility {
+                    trigger: mtg_ir::TriggerDef {
+                        event: mtg_ir::EventKind::PhaseBegin,
+                        filter: mtg_ir::EventFilter {
+                            detail: Some(mtg_ir::EventDetail::Phase {
+                                phase: Some(GamePhase::Upkeep),
+                                any_main_phase: false,
+                                enchanted_controller_upkeep: false,
+                                enchanted_player_upkeep: false,
+                                enchanted_opponent_end_step: false,
+                                phase_chosen_player: false,
+                                turn_filter: None,
+                            }),
+                            ..Default::default()
+                        },
+                        scope: Some(mtg_ir::TriggerScope::ControllerTurn),
+                        from_zones: None,
+                        only_once_per_turn: false,
+                        do_this_once_per_turn: false,
+                        is_state_trigger: false,
+                        or: vec![],
+                        chapter_numbers: SmallVec::new(),
+                        is_chapter_ability: false,
+                        spell_delayed: None,
+                    },
+                    condition: None,
+                    grant_condition: None,
+                    targets: vec![],
+                    effect: vec![synth_gain_life_step(3)],
+                    modal: None,
+                    text: None,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let discard_relic = CardDef {
+            oracle_id: "synth_cr514_discard_relic".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Discard Relic".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Discard Relic".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::ENCHANTMENT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::B,
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![AbilityDef::Triggered(mtg_ir::TriggeredAbility {
+                    trigger: mtg_ir::TriggerDef {
+                        event: mtg_ir::EventKind::Discard,
+                        filter: mtg_ir::EventFilter {
+                            player: Some(mtg_ir::PlayerFilter {
+                                relation: mtg_ir::PlayerRelation::You,
+                            }),
+                            ..Default::default()
+                        },
+                        scope: None,
+                        from_zones: None,
+                        only_once_per_turn: false,
+                        do_this_once_per_turn: false,
+                        is_state_trigger: false,
+                        or: vec![],
+                        chapter_numbers: SmallVec::new(),
+                        is_chapter_ability: false,
+                        spell_delayed: None,
+                    },
+                    condition: None,
+                    grant_condition: None,
+                    targets: vec![],
+                    effect: vec![synth_gain_life_step(1)],
+                    modal: None,
+                    text: None,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![plains, upkeep_relic, discard_relic],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 30],
+            sideboard: vec![],
+        };
+        let mut cfg = GameConfig::standard_1v1();
+        cfg.player_count = 2;
+        cfg.mulligan = MulliganRule::London { free_first: true };
+
+        // Part A: Single CleanupDiscard (8 cards -> discard 1) must immediately flush P0's Upkeep
+        // trigger onto the stack in GamePhase::Upkeep (CR 503.1a / CR 603.3), not delay until Draw.
+        {
+            let mut state = GameState::new(
+                Arc::clone(&db),
+                cfg.clone(),
+                &[deck.clone(), deck.clone()],
+                7,
+            )
+            .unwrap();
+            begin_opening_mulligans(&mut state).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap();
+
+            let _p0_upkeep = synth_put_card_on_bf(&mut state, PlayerId(0), CardDefId(1));
+
+            // Advance through P0 Turn 1 -> P1 Turn 2 CleanupDiscard (P1 draws 8th card in Draw).
+            while state.turn_number() == 1
+                || !matches!(state.decision(), DecisionState::Prompt { .. })
+            {
+                let p = state.priority_player();
+                match state.decision() {
+                    DecisionState::Priority => {
+                        pass_priority(&mut state, p).unwrap();
+                    }
+                    DecisionState::DeclareAttackers => {
+                        crate::combat::apply_combat_action(
+                            &mut state,
+                            p,
+                            &Action::ConfirmAttackers,
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected decision in Part A: {other:?}"),
+                }
+            }
+            assert_eq!(state.turn_number(), 2);
+            assert_eq!(state.phase(), GamePhase::Cleanup);
+
+            let pp = state.pending_prompt().unwrap().clone();
+            assert_eq!(pp.chooser, PlayerId(1));
+            let pick = state.player(PlayerId(1)).unwrap().hand[0];
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(1),
+                pp.prompt_id,
+                ChoiceAnswer::PickObject { id: pick },
+            )
+            .unwrap();
+
+            // Immediately on entering P0's Turn 3 Upkeep, trigger is flushed and DecisionState is Priority.
+            assert_eq!(state.turn_number(), 3);
+            assert_eq!(state.active_player(), PlayerId(0));
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+            assert_eq!(state.stack().len(), 1);
+            assert!(state.pending_triggers().is_empty());
+
+            // Resolve the trigger inside Upkeep (NOT delayed until Draw).
+            pass_priority(&mut state, PlayerId(0)).unwrap();
+            pass_priority(&mut state, PlayerId(1)).unwrap();
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert!(state.stack().is_empty());
+            assert_eq!(state.player(PlayerId(0)).unwrap().life, 23);
+        }
+
+        // Part B: Chained CleanupDiscard (9 cards -> remaining 2 -> 1 -> 0) AND CR 514.3a
+        // cleanup discard trigger flushing in Cleanup before advancing to P0's Upkeep.
+        {
+            let mut state =
+                GameState::new(Arc::clone(&db), cfg, &[deck.clone(), deck], 11).unwrap();
+            begin_opening_mulligans(&mut state).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap();
+
+            let _p0_upkeep = synth_put_card_on_bf(&mut state, PlayerId(0), CardDefId(1));
+            let _p1_discard = synth_put_card_on_bf(&mut state, PlayerId(1), CardDefId(2));
+
+            // Advance to P1's Turn 2 Main1, then add 1 extra card to P1's hand (9 cards total).
+            while state.turn_number() == 1 || state.phase() != GamePhase::Main1 {
+                let p = state.priority_player();
+                match state.decision() {
+                    DecisionState::Priority => {
+                        pass_priority(&mut state, p).unwrap();
+                    }
+                    DecisionState::DeclareAttackers => {
+                        crate::combat::apply_combat_action(
+                            &mut state,
+                            p,
+                            &Action::ConfirmAttackers,
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected decision advancing to P1 Main1: {other:?}"),
+                }
+            }
+            let ts = state.allocate_timestamp();
+            let extra = state.insert_object(
+                crate::state::GameObject::new(
+                    CardDefId(0),
+                    PlayerId(1),
+                    Zone::Hand,
+                    ts,
+                    ObjectFlags::empty(),
+                ),
+                None,
+            );
+            state.player_mut(PlayerId(1)).unwrap().hand.push(extra);
+            state.mark_dirty(DirtyMask::TOPOLOGY);
+            assert_eq!(state.player(PlayerId(1)).unwrap().hand.len(), 9);
+
+            // Advance to P1's CleanupDiscard prompt (remaining = 2).
+            while !matches!(state.decision(), DecisionState::Prompt { .. }) {
+                let p = state.priority_player();
+                match state.decision() {
+                    DecisionState::Priority => {
+                        pass_priority(&mut state, p).unwrap();
+                    }
+                    DecisionState::DeclareAttackers => {
+                        crate::combat::apply_combat_action(
+                            &mut state,
+                            p,
+                            &Action::ConfirmAttackers,
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected decision advancing to Cleanup: {other:?}"),
+                }
+            }
+
+            // 1st CleanupDiscard pick -> chains to 2nd CleanupDiscard prompt (remaining = 1).
+            let pp1 = state.pending_prompt().unwrap().clone();
+            assert!(matches!(
+                pp1.owner,
+                PromptOwner::Turn(TurnPromptKind::CleanupDiscard { remaining: 2, .. })
+            ));
+            let pick1 = state.player(PlayerId(1)).unwrap().hand[0];
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(1),
+                pp1.prompt_id,
+                ChoiceAnswer::PickObject { id: pick1 },
+            )
+            .unwrap();
+            assert!(matches!(state.decision(), DecisionState::Prompt { .. }));
+            let pp2 = state.pending_prompt().unwrap().clone();
+            assert!(matches!(
+                pp2.owner,
+                PromptOwner::Turn(TurnPromptKind::CleanupDiscard { remaining: 1, .. })
+            ));
+
+            // 2nd CleanupDiscard pick -> CR 514.3a flushes both Discard triggers in Cleanup!
+            let pick2 = state.player(PlayerId(1)).unwrap().hand[0];
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(1),
+                pp2.prompt_id,
+                ChoiceAnswer::PickObject { id: pick2 },
+            )
+            .unwrap();
+            assert_eq!(state.turn_number(), 2);
+            assert_eq!(state.phase(), GamePhase::Cleanup);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+            assert_eq!(state.stack().len(), 2);
+            assert!(state.pending_triggers().is_empty());
+
+            // Resolve both Discard triggers inside Cleanup (20 -> 22), then pass priority on empty
+            // stack in Cleanup (CR 514.3a) to re-run cleanup and advance to Turn 3 Upkeep.
+            for _ in 0..4 {
+                let p = state.priority_player();
+                pass_priority(&mut state, p).unwrap();
+            }
+            assert_eq!(state.player(PlayerId(1)).unwrap().life, 22);
+            assert_eq!(state.phase(), GamePhase::Cleanup);
+            assert!(state.stack().is_empty());
+
+            pass_priority(&mut state, PlayerId(1)).unwrap();
+            pass_priority(&mut state, PlayerId(0)).unwrap();
+
+            // Re-opened Cleanup completes with 7 cards -> advances to P0 Turn 3 Upkeep with trigger on stack.
+            assert_eq!(state.turn_number(), 3);
+            assert_eq!(state.active_player(), PlayerId(0));
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+            assert_eq!(state.stack().len(), 1);
+            assert!(state.pending_triggers().is_empty());
+
+            pass_priority(&mut state, PlayerId(0)).unwrap();
+            pass_priority(&mut state, PlayerId(1)).unwrap();
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert!(state.stack().is_empty());
+            assert_eq!(state.player(PlayerId(0)).unwrap().life, 23);
+        }
+    }
+
+    #[test]
+    fn synth_cr502_4_untap_optional_flushes_untap_and_upkeep_triggers_in_upkeep() {
+        let mut tables = InternTables::default();
+        tables.counters.push("stun".into());
+        tables.counters.push("lore".into());
+
+        let plains = CardDef {
+            oracle_id: "synth_cr502_plains".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth CR502 Plains".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth CR502 Plains".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::LAND,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::BASIC,
+                    colors: ColorMask::empty(),
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let optional_untap_watcher = CardDef {
+            oracle_id: "synth_cr502_untap_watcher".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Optional Untap Watcher".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Optional Untap Watcher".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::ARTIFACT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::empty(),
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![
+                    AbilityDef::Static(mtg_ir::StaticAbility {
+                        static_def: mtg_ir::StaticDef {
+                            condition: None,
+                            body: StaticBody::MayChooseNotToUntap {
+                                affected: Affected::SelfObj,
+                            },
+                        },
+                        span: Default::default(),
+                    }),
+                    AbilityDef::Triggered(mtg_ir::TriggeredAbility {
+                        trigger: mtg_ir::TriggerDef {
+                            event: mtg_ir::EventKind::BecomesUntapped,
+                            filter: mtg_ir::EventFilter {
+                                object: Some(mtg_ir::TriggerSubject::SelfObj),
+                                ..Default::default()
+                            },
+                            scope: None,
+                            from_zones: None,
+                            only_once_per_turn: false,
+                            do_this_once_per_turn: false,
+                            is_state_trigger: false,
+                            or: vec![],
+                            chapter_numbers: SmallVec::new(),
+                            is_chapter_ability: false,
+                            spell_delayed: None,
+                        },
+                        condition: None,
+                        grant_condition: None,
+                        targets: vec![],
+                        effect: vec![synth_gain_life_step(1)],
+                        modal: None,
+                        text: None,
+                        span: Default::default(),
+                    }),
+                ],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let upkeep_relic = CardDef {
+            oracle_id: "synth_cr502_upkeep_relic".into(),
+            compiler_version: 46,
+            text_hash: "0".into(),
+            name: "Synth Upkeep Beacon".into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: "Synth Upkeep Beacon".into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::ENCHANTMENT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::W,
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![AbilityDef::Triggered(mtg_ir::TriggeredAbility {
+                    trigger: mtg_ir::TriggerDef {
+                        event: mtg_ir::EventKind::PhaseBegin,
+                        filter: mtg_ir::EventFilter {
+                            detail: Some(mtg_ir::EventDetail::Phase {
+                                phase: Some(GamePhase::Upkeep),
+                                any_main_phase: false,
+                                enchanted_controller_upkeep: false,
+                                enchanted_player_upkeep: false,
+                                enchanted_opponent_end_step: false,
+                                phase_chosen_player: false,
+                                turn_filter: None,
+                            }),
+                            ..Default::default()
+                        },
+                        scope: Some(mtg_ir::TriggerScope::ControllerTurn),
+                        from_zones: None,
+                        only_once_per_turn: false,
+                        do_this_once_per_turn: false,
+                        is_state_trigger: false,
+                        or: vec![],
+                        chapter_numbers: SmallVec::new(),
+                        is_chapter_ability: false,
+                        spell_delayed: None,
+                    },
+                    condition: None,
+                    grant_condition: None,
+                    targets: vec![],
+                    effect: vec![synth_gain_life_step(3)],
+                    modal: None,
+                    text: None,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let db = Arc::new(
+            CardDatabase::from_bundle(IrV2Bundle {
+                ir_version: IR_V2_VERSION,
+                source_compiler_version: 46,
+                tables,
+                cards: vec![plains, optional_untap_watcher, upkeep_relic],
+                decks: vec![],
+            })
+            .unwrap(),
+        );
+        let deck = DeckSpec {
+            commanders: vec![],
+            mainboard: vec![CardDefId(0); 30],
+            sideboard: vec![],
+        };
+        let mut cfg = GameConfig::standard_1v1();
+        cfg.player_count = 2;
+        cfg.mulligan = MulliganRule::London { free_first: true };
+
+        let mut state = GameState::new(db, cfg, &[deck.clone(), deck], 17).unwrap();
+        begin_opening_mulligans(&mut state).unwrap();
+        apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap();
+        apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap();
+
+        let w1 = synth_put_card_on_bf(&mut state, PlayerId(0), CardDefId(1));
+        let w2 = synth_put_card_on_bf(&mut state, PlayerId(0), CardDefId(1));
+        let _upkeep_relic = synth_put_card_on_bf(&mut state, PlayerId(0), CardDefId(2));
+        state
+            .object_mut(w1)
+            .unwrap()
+            .flags
+            .insert(ObjectFlags::TAPPED);
+        state
+            .object_mut(w2)
+            .unwrap()
+            .flags
+            .insert(ObjectFlags::TAPPED);
+        state.mark_dirty(DirtyMask::TAPPED);
+
+        // Advance through P0 Turn 1 and P1 Turn 2 into P0 Turn 3 UntapOptional prompt.
+        while state.turn_number() < 3 {
+            let p = state.priority_player();
+            match state.decision() {
+                DecisionState::Priority => {
+                    pass_priority(&mut state, p).unwrap();
+                }
+                DecisionState::DeclareAttackers => {
+                    crate::combat::apply_combat_action(&mut state, p, &Action::ConfirmAttackers)
+                        .unwrap();
+                }
+                DecisionState::Prompt { .. } => {
+                    let pp = state.pending_prompt().unwrap().clone();
+                    let pick = match &pp.request {
+                        ChoiceRequest::ChooseObjects { candidates, .. } => candidates[0],
+                        other => panic!("unexpected prompt before Turn 3: {other:?}"),
+                    };
+                    crate::choices::apply_choice_answer(
+                        &mut state,
+                        pp.chooser,
+                        pp.prompt_id,
+                        ChoiceAnswer::PickObject { id: pick },
+                    )
+                    .unwrap();
+                }
+                other => panic!("unexpected decision advancing to Turn 3: {other:?}"),
+            }
+        }
+
+        // First UntapOptional prompt (w1): choose Yes (untap w1).
+        assert_eq!(state.turn_number(), 3);
+        assert_eq!(state.active_player(), PlayerId(0));
+        assert_eq!(state.phase(), GamePhase::Untap);
+        let pp1 = state.pending_prompt().unwrap().clone();
+        assert!(matches!(
+            pp1.owner,
+            PromptOwner::Turn(TurnPromptKind::UntapOptional { next_idx: 0, .. })
+        ));
+        crate::choices::apply_choice_answer(
+            &mut state,
+            PlayerId(0),
+            pp1.prompt_id,
+            ChoiceAnswer::YesNo { value: true },
+        )
+        .unwrap();
+
+        // Second UntapOptional prompt (w2): choose No (leave w2 tapped).
+        assert_eq!(state.phase(), GamePhase::Untap);
+        let pp2 = state.pending_prompt().unwrap().clone();
+        assert!(matches!(
+            pp2.owner,
+            PromptOwner::Turn(TurnPromptKind::UntapOptional { next_idx: 1, .. })
+        ));
+        crate::choices::apply_choice_answer(
+            &mut state,
+            PlayerId(0),
+            pp2.prompt_id,
+            ChoiceAnswer::YesNo { value: false },
+        )
+        .unwrap();
+
+        // Immediately upon entering Upkeep (CR 502.4), BOTH untap trigger (w1) and upkeep trigger
+        // flush in GamePhase::Upkeep (prompting P0 with OrderObjects per CR 603.3b).
+        assert_eq!(state.phase(), GamePhase::Upkeep);
+        assert!(state.pending_triggers().is_empty());
+        assert!(
+            !state
+                .object(w1)
+                .unwrap()
+                .flags
+                .contains(ObjectFlags::TAPPED)
+        );
+        assert!(
+            state
+                .object(w2)
+                .unwrap()
+                .flags
+                .contains(ObjectFlags::TAPPED)
+        );
+
+        let (order_pid, first_id) = match state.decision() {
+            DecisionState::Prompt {
+                request: ChoiceRequest::OrderObjects { prompt_id, objects },
+            } => {
+                assert_eq!(objects.len(), 2);
+                (*prompt_id, objects[0])
+            }
+            other => panic!("expected Upkeep OrderObjects trigger prompt, got {other:?}"),
+        };
+        crate::choices::apply_choice_answer(
+            &mut state,
+            PlayerId(0),
+            order_pid,
+            ChoiceAnswer::OrderNext { id: first_id },
+        )
+        .unwrap();
+
+        assert_eq!(state.phase(), GamePhase::Upkeep);
+        assert_eq!(state.decision(), &DecisionState::Priority);
+        assert_eq!(state.stack().len(), 2);
+        assert!(state.pending_triggers().is_empty());
+
+        // Resolve both triggers inside GamePhase::Upkeep (20 + 1 + 3 = 24).
+        for _ in 0..4 {
+            let p = state.priority_player();
+            pass_priority(&mut state, p).unwrap();
+        }
+        assert_eq!(state.phase(), GamePhase::Upkeep);
+        assert!(state.stack().is_empty());
+        assert_eq!(state.player(PlayerId(0)).unwrap().life, 24);
+    }
+
+    #[test]
+    fn synth_resume_turn_prompt_preserves_prompt_on_invalid_answers_and_completes_on_retry() {
+        let assert_prompt_preserved =
+            |state: &GameState, expected_pp: &crate::state::PendingPromptContext| {
+                assert!(crate::choices::is_prompt_active(state));
+                assert_eq!(state.pending_prompt(), Some(expected_pp));
+                assert!(matches!(state.decision(), DecisionState::Prompt { .. }));
+                assert!(
+                    !crate::choices::legal_choice_actions(state, expected_pp.chooser).is_empty()
+                );
+            };
+
+        // Case 1: CleanupDiscard — invalid answers preserve prompt + DecisionState::Prompt, valid retry completes.
+        {
+            let mut state = synth_state(2, true);
+            begin_opening_mulligans(&mut state).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap();
+
+            let bf_obj = synth_put_card_on_bf(&mut state, PlayerId(1), CardDefId(0));
+            let p0_hand_card = state.player(PlayerId(0)).unwrap().hand[0];
+
+            while !matches!(
+                state.pending_prompt().map(|p| &p.owner),
+                Some(PromptOwner::Turn(TurnPromptKind::CleanupDiscard { .. }))
+            ) {
+                let p = state.priority_player();
+                match state.decision() {
+                    DecisionState::Priority => {
+                        pass_priority(&mut state, p).unwrap();
+                    }
+                    DecisionState::DeclareAttackers => {
+                        crate::combat::apply_combat_action(
+                            &mut state,
+                            p,
+                            &Action::ConfirmAttackers,
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected decision advancing to CleanupDiscard: {other:?}"),
+                }
+            }
+
+            let pp = state.pending_prompt().unwrap().clone();
+            assert_eq!(pp.chooser, PlayerId(1));
+            let valid_hand_card = state.player(PlayerId(1)).unwrap().hand[0];
+
+            // Invalid via choices::apply_choice_answer
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id,
+                    ChoiceAnswer::PickObject { id: bf_obj },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id,
+                    ChoiceAnswer::PickObject { id: p0_hand_card },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(0),
+                    pp.prompt_id,
+                    ChoiceAnswer::PickObject {
+                        id: valid_hand_card,
+                    },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id + 1,
+                    ChoiceAnswer::PickObject {
+                        id: valid_hand_card,
+                    },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            // Invalid via direct turn::resume_turn_prompt
+            assert!(
+                resume_turn_prompt(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id,
+                    ChoiceAnswer::DonePicking
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            assert!(
+                resume_turn_prompt(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id,
+                    ChoiceAnswer::PickObject { id: bf_obj },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            // Valid retry completes cleanly
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(1),
+                pp.prompt_id,
+                ChoiceAnswer::PickObject {
+                    id: valid_hand_card,
+                },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.player(PlayerId(1)).unwrap().hand.len(), 7);
+            assert_eq!(state.turn_number(), 3);
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // Case 2: UntapOptional — invalid answers preserve prompt, valid retry untaps and advances.
+        {
+            let tables = InternTables::default();
+            let plains = CardDef {
+                oracle_id: "synth_turn_retry_plains".into(),
+                compiler_version: 46,
+                text_hash: "0".into(),
+                name: "Synth Turn Retry Plains".into(),
+                layout: CardLayout::Normal,
+                faces: vec![FaceDef {
+                    name: "Synth Turn Retry Plains".into(),
+                    characteristics: Characteristics {
+                        mana_cost: ManaCost::default(),
+                        types: CardTypeMask::LAND,
+                        subtypes: SmallVec::new(),
+                        supertypes: SupertypeMask::BASIC,
+                        colors: ColorMask::empty(),
+                        color_indicator: None,
+                        pt: None,
+                        loyalty: None,
+                        defense: None,
+                    },
+                    abilities: vec![],
+                    has_read_ahead: false,
+                    prototype_spec: None,
+                    cleaved_spell_spec: None,
+                    gift_promised_spell_spec: None,
+                }],
+                fully_supported: true,
+            };
+            let optional_relic = CardDef {
+                oracle_id: "synth_turn_retry_optional_relic".into(),
+                compiler_version: 46,
+                text_hash: "0".into(),
+                name: "Synth Turn Retry Optional Relic".into(),
+                layout: CardLayout::Normal,
+                faces: vec![FaceDef {
+                    name: "Synth Turn Retry Optional Relic".into(),
+                    characteristics: Characteristics {
+                        mana_cost: ManaCost::default(),
+                        types: CardTypeMask::ARTIFACT,
+                        subtypes: SmallVec::new(),
+                        supertypes: SupertypeMask::empty(),
+                        colors: ColorMask::empty(),
+                        color_indicator: None,
+                        pt: None,
+                        loyalty: None,
+                        defense: None,
+                    },
+                    abilities: vec![AbilityDef::Static(mtg_ir::StaticAbility {
+                        static_def: mtg_ir::StaticDef {
+                            condition: None,
+                            body: StaticBody::MayChooseNotToUntap {
+                                affected: Affected::SelfObj,
+                            },
+                        },
+                        span: Default::default(),
+                    })],
+                    has_read_ahead: false,
+                    prototype_spec: None,
+                    cleaved_spell_spec: None,
+                    gift_promised_spell_spec: None,
+                }],
+                fully_supported: true,
+            };
+            let db = Arc::new(
+                CardDatabase::from_bundle(IrV2Bundle {
+                    ir_version: IR_V2_VERSION,
+                    source_compiler_version: 46,
+                    tables,
+                    cards: vec![plains, optional_relic],
+                    decks: vec![],
+                })
+                .unwrap(),
+            );
+            let deck = DeckSpec {
+                commanders: vec![],
+                mainboard: vec![CardDefId(0); 30],
+                sideboard: vec![],
+            };
+            let mut cfg = GameConfig::standard_1v1();
+            cfg.mulligan = MulliganRule::London { free_first: true };
+            let mut state = GameState::new(db, cfg, &[deck.clone(), deck], 29).unwrap();
+            begin_opening_mulligans(&mut state).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap();
+
+            let w1 = synth_put_card_on_bf(&mut state, PlayerId(0), CardDefId(1));
+            state
+                .object_mut(w1)
+                .unwrap()
+                .flags
+                .insert(ObjectFlags::TAPPED);
+            state.mark_dirty(DirtyMask::TAPPED);
+
+            while state.turn_number() < 3 {
+                let p = state.priority_player();
+                match state.decision() {
+                    DecisionState::Priority => {
+                        pass_priority(&mut state, p).unwrap();
+                    }
+                    DecisionState::DeclareAttackers => {
+                        crate::combat::apply_combat_action(
+                            &mut state,
+                            p,
+                            &Action::ConfirmAttackers,
+                        )
+                        .unwrap();
+                    }
+                    DecisionState::Prompt { .. } => {
+                        let pp = state.pending_prompt().unwrap().clone();
+                        let pick = match &pp.request {
+                            ChoiceRequest::ChooseObjects { candidates, .. } => candidates[0],
+                            other => panic!("unexpected prompt before Turn 3: {other:?}"),
+                        };
+                        crate::choices::apply_choice_answer(
+                            &mut state,
+                            pp.chooser,
+                            pp.prompt_id,
+                            ChoiceAnswer::PickObject { id: pick },
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected decision before Turn 3: {other:?}"),
+                }
+            }
+
+            let pp = state.pending_prompt().unwrap().clone();
+            assert_eq!(pp.chooser, PlayerId(0));
+            assert!(matches!(
+                pp.owner,
+                PromptOwner::Turn(TurnPromptKind::UntapOptional { .. })
+            ));
+
+            for bad in [
+                ChoiceAnswer::PickObject { id: w1 },
+                ChoiceAnswer::DonePicking,
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), pp.prompt_id, bad)
+                        .is_err()
+                );
+                assert_prompt_preserved(&state, &pp);
+            }
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(1),
+                    pp.prompt_id,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(0),
+                    pp.prompt_id + 1,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+            assert!(
+                resume_turn_prompt(
+                    &mut state,
+                    PlayerId(0),
+                    pp.prompt_id,
+                    ChoiceAnswer::DonePicking
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp);
+
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                pp.prompt_id,
+                ChoiceAnswer::YesNo { value: true },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert!(
+                !state
+                    .object(w1)
+                    .unwrap()
+                    .flags
+                    .contains(ObjectFlags::TAPPED)
+            );
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+        }
+
+        // Case 3: EndTurnMay (`false` and `true`) + wrong PromptOwner
+        {
+            let mut state = synth_state(2, true);
+            begin_opening_mulligans(&mut state).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(0), &Action::KeepHand).unwrap();
+            apply_mulligan_action(&mut state, PlayerId(1), &Action::KeepHand).unwrap();
+
+            let p0_hand_card = state.player(PlayerId(0)).unwrap().hand[0];
+            let pid1 = state.allocate_prompt_id();
+            let req1 = ChoiceRequest::YesNo {
+                prompt_id: pid1,
+                label: "End the turn?".into(),
+            };
+            let pp1 = crate::state::PendingPromptContext {
+                prompt_id: pid1,
+                chooser: PlayerId(0),
+                request: req1.clone(),
+                owner: PromptOwner::Turn(TurnPromptKind::EndTurnMay),
+            };
+            state.set_pending_prompt(Some(pp1.clone()));
+            state.set_decision(DecisionState::Prompt { request: req1 });
+
+            for bad in [
+                ChoiceAnswer::DonePicking,
+                ChoiceAnswer::PickObject { id: p0_hand_card },
+            ] {
+                assert!(
+                    crate::choices::apply_choice_answer(&mut state, PlayerId(0), pid1, bad)
+                        .is_err()
+                );
+                assert_prompt_preserved(&state, &pp1);
+            }
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(1),
+                    pid1,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp1);
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(0),
+                    pid1 + 1,
+                    ChoiceAnswer::YesNo { value: true },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp1);
+            assert!(
+                resume_turn_prompt(&mut state, PlayerId(0), pid1, ChoiceAnswer::DonePicking)
+                    .is_err()
+            );
+            assert_prompt_preserved(&state, &pp1);
+
+            // Subcase A: retry false -> remains Turn 1 Main1 with Priority
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                pid1,
+                ChoiceAnswer::YesNo { value: false },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.turn_number(), 1);
+            assert_eq!(state.phase(), GamePhase::Main1);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+
+            // Subcase B: re-install EndTurnMay, send invalid DonePicking, then retry true -> Turn 2
+            let pid2 = state.allocate_prompt_id();
+            let req2 = ChoiceRequest::YesNo {
+                prompt_id: pid2,
+                label: "End the turn?".into(),
+            };
+            let pp2 = crate::state::PendingPromptContext {
+                prompt_id: pid2,
+                chooser: PlayerId(0),
+                request: req2.clone(),
+                owner: PromptOwner::Turn(TurnPromptKind::EndTurnMay),
+            };
+            state.set_pending_prompt(Some(pp2.clone()));
+            state.set_decision(DecisionState::Prompt { request: req2 });
+
+            assert!(
+                crate::choices::apply_choice_answer(
+                    &mut state,
+                    PlayerId(0),
+                    pid2,
+                    ChoiceAnswer::DonePicking,
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &pp2);
+
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                pid2,
+                ChoiceAnswer::YesNo { value: true },
+            )
+            .unwrap();
+            assert!(state.pending_prompt().is_none());
+            assert_eq!(state.turn_number(), 2);
+            assert_eq!(state.active_player(), PlayerId(1));
+            assert_eq!(state.phase(), GamePhase::Upkeep);
+            assert_eq!(state.decision(), &DecisionState::Priority);
+
+            // Wrong PromptOwner check via direct resume_turn_prompt
+            let pid3 = state.allocate_prompt_id();
+            let req3 = ChoiceRequest::YesNo {
+                prompt_id: pid3,
+                label: "Return commander?".into(),
+            };
+            let other_pp = crate::state::PendingPromptContext {
+                prompt_id: pid3,
+                chooser: PlayerId(0),
+                request: req3.clone(),
+                owner: PromptOwner::Sba(crate::state::SbaPromptKind::CommanderReturn {
+                    commander: p0_hand_card,
+                    owner: PlayerId(0),
+                    from_zone: Zone::Graveyard,
+                }),
+            };
+            state.set_pending_prompt(Some(other_pp.clone()));
+            state.set_decision(DecisionState::Prompt { request: req3 });
+
+            assert!(
+                resume_turn_prompt(
+                    &mut state,
+                    PlayerId(0),
+                    pid3,
+                    ChoiceAnswer::YesNo { value: false },
+                )
+                .is_err()
+            );
+            assert_prompt_preserved(&state, &other_pp);
+        }
     }
 }

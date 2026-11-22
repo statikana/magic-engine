@@ -1099,7 +1099,7 @@ pub(crate) fn compute_effective_ability_cost_cached(
             "activated ability {ability_index} not found on {object:?}"
         )));
     };
-    let Some(act) = res_ab.activated else {
+    let Some(act) = res_ab.activated.as_deref() else {
         // Intrinsic basic mana ability has {T} cost only
         return Ok(EffectiveCostBreakdown {
             base_mana: ManaCost::default(),
@@ -1154,16 +1154,6 @@ pub(crate) fn compute_effective_ability_cost_cached(
     let mut working = base_mana.clone();
     let mut acc = CostDeltaAccumulator::default();
 
-    // Check activation_cost_reduction on the ability itself
-    if let Some(red) = &act.activation_cost_reduction
-        && red
-            .condition
-            .as_deref()
-            .is_none_or(|c| evaluate_condition(state, c, &ctx))
-    {
-        acc.push_delta(state, &red.delta, &ctx, chosen_targets);
-    }
-
     // Check FirstActivationZeroCost & CostModifier for abilities
     let cost_kw_name = act
         .cost_keyword
@@ -1172,6 +1162,8 @@ pub(crate) fn compute_effective_ability_cost_cached(
     let p_zero_mask = state
         .player(controller)
         .map_or(0, |p| p.used_first_activation_zero_mask);
+
+    let mut paired_static_handles_reduction = false;
 
     for p in state.players() {
         if p.lost {
@@ -1242,6 +1234,21 @@ pub(crate) fn compute_effective_ability_cost_cached(
                         who_enchanted_player,
                         ..
                     } => {
+                        if src_id == object
+                            && let Some(red) = &act.activation_cost_reduction
+                            && matches!(
+                                affects,
+                                SpellOrAbilityFilter::Ability {
+                                    self_source_only: true,
+                                    keyword: Some(kw),
+                                    ..
+                                } if act.cost_keyword == Some(*kw)
+                            )
+                            && delta == &red.delta
+                            && st.static_def.condition.as_deref() == red.condition.as_deref()
+                        {
+                            paired_static_handles_reduction = true;
+                        }
                         if let Some(cond) = st.static_def.condition.as_deref()
                             && !evaluate_condition(state, cond, &src_ctx)
                         {
@@ -1266,6 +1273,18 @@ pub(crate) fn compute_effective_ability_cost_cached(
                 }
             }
         }
+    }
+
+    // Check activation_cost_reduction on the ability itself unless an identical paired
+    // self-source StaticBody::CostModifier on this object already covers it.
+    if !paired_static_handles_reduction
+        && let Some(red) = &act.activation_cost_reduction
+        && red
+            .condition
+            .as_deref()
+            .is_none_or(|c| evaluate_condition(state, c, &ctx))
+    {
+        acc.push_delta(state, &red.delta, &ctx, chosen_targets);
     }
 
     acc.apply_to_cost(&mut working, &ManaCost::default(), 0);

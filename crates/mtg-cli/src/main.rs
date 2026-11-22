@@ -3,10 +3,12 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use mtg_engine::TsReplayTrace;
+use mtg_engine::replay::run_ts_diff_test;
 use mtg_ir::{CardDatabase, IrV2Bundle};
 
 #[derive(Debug, Parser)]
@@ -41,7 +43,15 @@ enum Command {
         verify_precons: bool,
     },
     /// Replay a TS-recorded `ts-replay.json` trace against Rust `mtg-engine` (Phase 1–2).
-    DiffTest { db: PathBuf, replay: PathBuf },
+    DiffTest {
+        /// Path to `cards.bin`.
+        db: PathBuf,
+        /// Path to `ts-replay.json`.
+        replay: PathBuf,
+        /// Print additional timing and trace metadata on success.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -137,16 +147,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::DiffTest {
             db: db_path,
             replay,
+            verbose,
         } => {
-            let db = CardDatabase::decode_bytes(&fs::read(&db_path)?)?;
+            let t0 = Instant::now();
+            let db = Arc::new(CardDatabase::decode_bytes(&fs::read(&db_path)?)?);
             let trace: TsReplayTrace = serde_json::from_str(&fs::read_to_string(&replay)?)?;
-            println!(
-                "Loaded DB ({} cards) and TS replay trace (seed={}, {} seats, {} steps). Full step diffing activates in Phase 1.",
-                db.cards.len(),
-                trace.seed,
-                trace.seats.len(),
-                trace.steps.len()
-            );
+            match run_ts_diff_test(Arc::clone(&db), &trace) {
+                Ok(report) => {
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "PASS: diff-test replayed {} steps ({} seats, seed={}, end=T{} {:?}) in {:.2} ms with 0 divergences.",
+                        report.steps_replayed,
+                        report.seat_count,
+                        report.seed,
+                        report.final_turn,
+                        report.final_phase,
+                        elapsed_ms
+                    );
+                    if verbose {
+                        println!(
+                            "  DB cards: {} | compiler v{} | trace format v{}",
+                            db.cards.len(),
+                            trace.compiler_version,
+                            trace.format_version
+                        );
+                    }
+                }
+                Err(failure) => {
+                    eprintln!("FAIL: diff-test divergence: {failure}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
     Ok(())

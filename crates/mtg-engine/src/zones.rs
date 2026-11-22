@@ -1467,6 +1467,7 @@ pub fn transfer_control_raw(
     }
     if let Some(rare) = state.rare_or_default(id) {
         rare.came_under_control_at = Some(ts);
+        rare.default_controller = Some(new_controller);
     }
     state.mark_dirty(DirtyMask::TOPOLOGY);
     Ok(())
@@ -4344,7 +4345,7 @@ mod tests {
         let tok_pw2 = create_token_copy_raw(&mut state, PlayerId(0), tok_pw, None, false).unwrap();
         assert_eq!(state.counter_count(tok_pw2, loyalty_cid), 3);
 
-        // 5. Doubling Season-style PutCounters multiplier doubles ETB loyalty (6) and defense (10).
+        // 5. Synth Doubler-style PutCounters multiplier doubles ETB loyalty (6) and defense (10).
         let doubler_hand = spawn_hand(&mut state, CardDefId(3));
         let MoveObjectOutcome::Moved(_) = move_object(
             &mut state,
@@ -4385,5 +4386,105 @@ mod tests {
             10
         );
         let _ = state.evaluate_board();
+    }
+
+    #[test]
+    fn synth_transfer_control_raw_updates_layer_cache_controller() {
+        use crate::layers::predicates::{ContinuousTarget, TimedContinuousEffect};
+        use mtg_ir::{Duration, Layer, LayerMod, PlayerRef};
+
+        let db = make_test_db();
+        let mut state = boot_state(db, CardDefId(0));
+
+        // Simulate casting a creature from hand so RareObjectState exists at ETB
+        // and `zones.rs` records `rare.default_controller = Some(PlayerId(0))`.
+        let hand_id = state.players()[0].hand[0];
+        let stack_id = move_object_raw(
+            &mut state,
+            hand_id,
+            Zone::Stack,
+            MoveRawOptions::default(),
+            None,
+        )
+        .unwrap()
+        .new_id
+        .unwrap();
+        state.rare_or_default(stack_id).unwrap().cast_from_zone = Some(Zone::Hand);
+        let bf_id = move_object_raw(
+            &mut state,
+            stack_id,
+            Zone::Battlefield,
+            MoveRawOptions::default(),
+            None,
+        )
+        .unwrap()
+        .new_id
+        .unwrap();
+
+        assert_eq!(
+            state.rare(bf_id).and_then(|r| r.default_controller),
+            Some(PlayerId(0))
+        );
+        assert_eq!(
+            state.evaluate_board().get(bf_id).unwrap().controller,
+            PlayerId(0)
+        );
+
+        // Permanent GainControl (`Duration::None`) calls `transfer_control_raw`:
+        // both `obj.controller`, `rare.default_controller`, and `LayerCache` must update.
+        transfer_control_raw(&mut state, bf_id, PlayerId(1)).unwrap();
+        assert_eq!(state.object(bf_id).unwrap().controller, PlayerId(1));
+        assert_eq!(
+            state.rare(bf_id).and_then(|r| r.default_controller),
+            Some(PlayerId(1))
+        );
+        assert!(state.players()[1].battlefield.contains(&bf_id));
+        assert!(!state.players()[0].battlefield.contains(&bf_id));
+        assert_eq!(
+            state.evaluate_board().get(bf_id).unwrap().controller,
+            PlayerId(1)
+        );
+
+        // A temporary Layer 2 `SetController` still overrides `default_controller`,
+        // and removing it reverts `LayerCache` to `PlayerId(1)` (the permanent controller).
+        let eff_id = state.allocate_continuous_effect_id();
+        let ts = state.allocate_timestamp();
+        state.add_continuous_effect(TimedContinuousEffect {
+            id: eff_id,
+            source: None,
+            controller: PlayerId(0),
+            layer: Layer::Layer2,
+            affected: ContinuousTarget::Objects(smallvec::smallvec![bf_id]),
+            modifier: LayerMod::SetController {
+                controller: PlayerRef::You,
+            },
+            duration: Duration::EndOfTurn,
+            timestamp: ts,
+            expires_turn: None,
+            expires_on_player: None,
+            chosen_color: None,
+            chosen_subtype: None,
+            chosen_player: None,
+            chosen_card_type: None,
+            locked_pt: None,
+            is_cda: false,
+        });
+        assert_eq!(
+            state.evaluate_board().get(bf_id).unwrap().controller,
+            PlayerId(0)
+        );
+
+        state.retain_continuous_effects(|e| e.id != eff_id);
+        assert_eq!(
+            state.evaluate_board().get(bf_id).unwrap().controller,
+            PlayerId(1)
+        );
+
+        // Transferring control back to PlayerId(0) updates LayerCache again.
+        transfer_control_raw(&mut state, bf_id, PlayerId(0)).unwrap();
+        assert_eq!(
+            state.evaluate_board().get(bf_id).unwrap().controller,
+            PlayerId(0)
+        );
     }
 }

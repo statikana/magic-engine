@@ -2192,10 +2192,16 @@ mod tests {
         )
         .unwrap();
 
-        // P0 takes 1 mulligan -> must bottom 1 card (standard_1v1 free_first = false).
+        // P0 takes 1 mulligan, then both P0 and P1 keep hands before CR 103.5 Stage 2 bottoming.
         session
             .apply_action(PlayerId(0), Action::TakeMulligan)
             .unwrap();
+        session.apply_action(PlayerId(0), Action::KeepHand).unwrap();
+        assert_eq!(session.current_actor(), Some(PlayerId(1)));
+        session.apply_action(PlayerId(1), Action::KeepHand).unwrap();
+        assert_eq!(session.current_actor(), Some(PlayerId(0)));
+        assert_eq!(session.state().mulligan_bottom_remaining(PlayerId(0)), 1);
+
         let wrong_bottom_rev = session.state().layer_rev();
         let wrong_log_len = session.replay_log().entries.len();
         let err_bottom = session.apply_macro_action(
@@ -2207,7 +2213,8 @@ mod tests {
         assert!(matches!(err_bottom, Err(EngineError::IllegalAction(_))));
         assert_eq!(session.state().layer_rev(), wrong_rev_or(wrong_bottom_rev));
         assert_eq!(session.replay_log().entries.len(), wrong_log_len);
-        assert!(!session.state().players()[0].has_kept_hand);
+        assert_eq!(session.state().mulligan_bottom_remaining(PlayerId(0)), 1);
+        assert_eq!(session.state().players()[0].hand.len(), 7);
 
         let bottom_card = session.state().players()[0].hand[0];
         session
@@ -2219,8 +2226,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session.state().players()[0].hand.len(), 6);
-        assert_eq!(session.current_actor(), Some(PlayerId(1)));
-        session.apply_action(PlayerId(1), Action::KeepHand).unwrap();
+        assert_eq!(session.current_actor(), Some(PlayerId(0)));
 
         // Find a Forest and a Cub in P0's hand.
         let forest_h = session.state().players()[0]

@@ -384,9 +384,10 @@ fn source_has_protection_quality(
                 .source_lki
                 .is_some_and(|l| l.last_zone == Zone::Battlefield));
     let was_cast_this_turn = live_obj.is_some_and(|o| {
-        o.flags.contains(
-            crate::state::ObjectFlags::WAS_CAST | crate::state::ObjectFlags::ENTERED_THIS_TURN,
-        )
+        !o.is_token()
+            && o.flags.contains(
+                crate::state::ObjectFlags::WAS_CAST | crate::state::ObjectFlags::ENTERED_THIS_TURN,
+            )
     });
     let is_modified = if quality.to_ascii_lowercase().contains("modified") {
         info.source_object.is_some_and(|id| {

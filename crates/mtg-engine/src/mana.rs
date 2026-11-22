@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use mtg_ir::{
@@ -20,6 +21,7 @@ use crate::faces::{
 };
 use crate::filter::{matches_object_filter, matches_plain_mana_filter};
 use crate::id::{ObjectId, PlayerId};
+use crate::keywords::synthesize_keyword_activated_ability;
 use crate::layers::predicates::GrantedAbilityEntry;
 use crate::state::{
     DirtyMask, EngineError, GameState, LayerCache, LkiSnapshot, ManaAbilityPromptState,
@@ -172,6 +174,7 @@ pub struct ManaAbilityCandidate {
     pub max_any_color_amount: u32,
     pub bundle_options: Vec<SmallVec<[ManaColor; 3]>>,
     pub restriction: Option<ManaSpendingRestriction>,
+    pub has_delayed_rider: bool,
     pub extra_mana_cost: Option<ManaCost>,
     pub requires_tap: bool,
     pub requires_untap: bool,
@@ -209,7 +212,7 @@ pub enum ManaActivationOutcome {
 pub(crate) struct ResolvedManaAbility<'a> {
     pub ability_index: u16,
     pub is_intrinsic_basic: Option<ManaColor>,
-    pub activated: Option<&'a mtg_ir::ActivatedAbility>,
+    pub activated: Option<Cow<'a, mtg_ir::ActivatedAbility>>,
     pub mana_as_any_color: bool,
     pub grant_once_each_turn: bool,
 }
@@ -286,17 +289,6 @@ pub(crate) fn resolve_object_activated_abilities_cached<'a>(
 
         let innate_abilities = active_abilities_with_card_for_object(state, id, ctx);
         for ab_ref in innate_abilities {
-            let AbilityDef::Activated(act) = ab_ref.ability else {
-                continue;
-            };
-            let is_mana_ab = act.is_mana || act.timing == Timing::Mana;
-            if is_mana_ab {
-                if innate_mana_removed {
-                    continue;
-                }
-            } else if innate_removed {
-                continue;
-            }
             let base_offset = if ab_ref.component_index == 0 {
                 primary_face_offsets
                     .iter()
@@ -309,15 +301,41 @@ pub(crate) fn resolve_object_activated_abilities_cached<'a>(
                     .map_or(0, |(_, off)| *off)
             };
             let shared_idx = base_offset.saturating_add(ab_ref.ability_index);
-            if let Ok(ability_index) = u16::try_from(shared_idx) {
-                out.push(ResolvedManaAbility {
-                    ability_index,
-                    is_intrinsic_basic: None,
-                    activated: Some(act),
-                    mana_as_any_color: false,
-                    grant_once_each_turn: false,
-                });
-            }
+            let Ok(ability_index) = u16::try_from(shared_idx) else {
+                continue;
+            };
+            let activated = match ab_ref.ability {
+                AbilityDef::Activated(act) => {
+                    let is_mana_ab = act.is_mana || act.timing == Timing::Mana;
+                    if is_mana_ab {
+                        if innate_mana_removed {
+                            continue;
+                        }
+                    } else if innate_removed {
+                        continue;
+                    }
+                    Cow::Borrowed(act)
+                }
+                AbilityDef::Keyword(kw_ab) => {
+                    if innate_removed {
+                        continue;
+                    }
+                    let Some(synth) =
+                        synthesize_keyword_activated_ability(state.db(), kw_ab, shared_idx)
+                    else {
+                        continue;
+                    };
+                    Cow::Owned(synth)
+                }
+                _ => continue,
+            };
+            out.push(ResolvedManaAbility {
+                ability_index,
+                is_intrinsic_basic: None,
+                activated: Some(activated),
+                mana_as_any_color: false,
+                grant_once_each_turn: false,
+            });
         }
     }
 
@@ -347,27 +365,51 @@ pub(crate) fn resolve_object_activated_abilities_cached<'a>(
                 } => {
                     if let Some(card) = state.db().get(*card_def)
                         && let Some(face) = card.faces.get(*face_index as usize)
-                        && let Some(AbilityDef::Activated(act)) = face.abilities.get(*donor_ab_idx)
+                        && let Some(ab) = face.abilities.get(*donor_ab_idx)
                     {
+                        let activated = match ab {
+                            AbilityDef::Activated(act) => Cow::Borrowed(act),
+                            AbilityDef::Keyword(kw_ab) => {
+                                let Some(synth) = synthesize_keyword_activated_ability(
+                                    state.db(),
+                                    kw_ab,
+                                    *donor_ab_idx,
+                                ) else {
+                                    continue;
+                                };
+                                Cow::Owned(synth)
+                            }
+                            _ => continue,
+                        };
                         out.push(ResolvedManaAbility {
                             ability_index,
                             is_intrinsic_basic: None,
-                            activated: Some(act),
+                            activated: Some(activated),
                             mana_as_any_color: *mana_as_any_color,
                             grant_once_each_turn: *once_each_turn,
                         });
                     }
                 }
                 GrantedAbilityEntry::Inline { ability, .. } => {
-                    if let AbilityDef::Activated(act) = ability.as_ref() {
-                        out.push(ResolvedManaAbility {
-                            ability_index,
-                            is_intrinsic_basic: None,
-                            activated: Some(act),
-                            mana_as_any_color: false,
-                            grant_once_each_turn: false,
-                        });
-                    }
+                    let activated = match ability.as_ref() {
+                        AbilityDef::Activated(act) => Cow::Borrowed(act),
+                        AbilityDef::Keyword(kw_ab) => {
+                            let Some(synth) =
+                                synthesize_keyword_activated_ability(state.db(), kw_ab, gi)
+                            else {
+                                continue;
+                            };
+                            Cow::Owned(synth)
+                        }
+                        _ => continue,
+                    };
+                    out.push(ResolvedManaAbility {
+                        ability_index,
+                        is_intrinsic_basic: None,
+                        activated: Some(activated),
+                        mana_as_any_color: false,
+                        grant_once_each_turn: false,
+                    });
                 }
                 GrantedAbilityEntry::DynamicWard { .. } => {}
             }
@@ -404,7 +446,7 @@ pub(crate) fn resolve_object_activated_abilities_cached<'a>(
                 if res.is_intrinsic_basic == Some(basic_color) {
                     return true;
                 }
-                let Some(act) = res.activated else {
+                let Some(act) = res.activated.as_deref() else {
                     return false;
                 };
                 is_activated_mana_ability(act)
@@ -786,7 +828,7 @@ fn land_producible_colors_with_depth_cached(
             mask |= ColorMask::from_mana_color(c);
             continue;
         }
-        let Some(act) = res_ab.activated else {
+        let Some(act) = res_ab.activated.as_deref() else {
             continue;
         };
         if !is_activated_mana_ability(act) {
@@ -1191,6 +1233,7 @@ pub(crate) fn enumerate_mana_abilities_cached(
                         max_any_color_amount: 0,
                         bundle_options: Vec::new(),
                         restriction: None,
+                        has_delayed_rider: false,
                         extra_mana_cost: None,
                         requires_tap: true,
                         requires_untap: false,
@@ -1208,7 +1251,7 @@ pub(crate) fn enumerate_mana_abilities_cached(
                     continue;
                 }
 
-                let Some(act) = res_ab.activated else {
+                let Some(act) = res_ab.activated.as_deref() else {
                     continue;
                 };
                 if !is_activated_mana_ability(act) {
@@ -1363,6 +1406,7 @@ pub(crate) fn enumerate_mana_abilities_cached(
                 let mut bundle_options: Vec<SmallVec<[ManaColor; 3]>> = Vec::new();
                 let mut restriction: Option<ManaSpendingRestriction> = None;
                 let mut has_tag_restriction = false;
+                let mut has_delayed_rider = false;
 
                 let eff_ctx =
                     EvalContext::for_source(player, id).with_board(BoardView::Cached(cache));
@@ -1376,11 +1420,13 @@ pub(crate) fn enumerate_mana_abilities_cached(
                         production,
                         restriction: tag,
                         restriction_spec,
+                        delayed_rider,
                         ..
                     } = &step.op
                     else {
                         continue;
                     };
+                    has_delayed_rider |= delayed_rider.is_some();
                     if let Some(r_tag) = tag {
                         has_tag_restriction = true;
                         let tag_spec = restriction_for_tag(*r_tag);
@@ -1535,7 +1581,11 @@ pub(crate) fn enumerate_mana_abilities_cached(
                         || ev.types.contains(CardTypeMask::CREATURE)
                     {
                         3
-                    } else if restriction.is_some() || has_tag_restriction {
+                    } else if has_tag_restriction
+                        || restriction.as_ref().is_some_and(|r| {
+                            r.allow_spells.is_some() || r.allow_abilities.is_some()
+                        })
+                    {
                         0
                     } else if produces_colors.color_count() <= 1 && max_any_color_amount == 0 {
                         1
@@ -1552,6 +1602,7 @@ pub(crate) fn enumerate_mana_abilities_cached(
                     max_any_color_amount,
                     bundle_options,
                     restriction,
+                    has_delayed_rider,
                     extra_mana_cost,
                     requires_tap,
                     requires_untap,
@@ -1718,7 +1769,7 @@ pub(crate) fn activate_mana_ability_with_bundle(
         if let Some(color) = res_ab.is_intrinsic_basic {
             ManaPreActivation::IntrinsicBasic { color, is_land }
         } else {
-            let Some(act) = res_ab.activated else {
+            let Some(act) = res_ab.activated.as_deref() else {
                 return Err(EngineError::IllegalAction(
                     "missing activated ability".into(),
                 ));
@@ -2044,7 +2095,7 @@ pub fn resume_mana_color_choice(
                 "missing activated ability".into(),
             ));
         };
-        (act.clone(), is_land)
+        (act.into_owned(), is_land)
     };
 
     // If a bundle was chosen specifically by index (e.g. [W, B] vs [W, W]), pass bundle directly
@@ -3090,6 +3141,7 @@ pub(crate) struct SimBucket {
     pub colors: [u32; 6],
     pub disallow_generic: bool,
     pub is_snow: bool,
+    pub has_spend_restriction: bool,
 }
 
 /// Internal pool snapshot used by both pool payment verification and auto-tap simulation.
@@ -3127,6 +3179,9 @@ impl SimulatedManaPool {
                         colors: b.colors,
                         disallow_generic: b.restriction.disallow_generic,
                         is_snow: b.is_snow,
+                        has_spend_restriction: b.source_tag.is_some()
+                            || b.restriction.allow_spells.is_some()
+                            || b.restriction.allow_abilities.is_some(),
                     });
                 }
             }
@@ -3385,11 +3440,17 @@ fn consume_one_non_snow_from_color_idx(
     pool_spent: &mut [u32; 6],
 ) -> bool {
     for dg_first in [true, false] {
-        for (bi, b) in work.buckets.iter_mut().enumerate() {
-            if !b.is_snow && b.disallow_generic == dg_first && b.colors[c_idx] > 0 {
-                b.colors[c_idx] -= 1;
-                bucket_spent[bi].1[c_idx] += 1;
-                return true;
+        for sr_first in [true, false] {
+            for (bi, b) in work.buckets.iter_mut().enumerate() {
+                if !b.is_snow
+                    && b.disallow_generic == dg_first
+                    && b.has_spend_restriction == sr_first
+                    && b.colors[c_idx] > 0
+                {
+                    b.colors[c_idx] -= 1;
+                    bucket_spent[bi].1[c_idx] += 1;
+                    return true;
+                }
             }
         }
     }
@@ -3413,13 +3474,19 @@ fn consume_one_from_color_idx(
     snow_spent: &mut [u32; 6],
 ) -> bool {
     if conserve_snow_buckets {
-        // 1. Spend from eligible non-snow restricted buckets first (`dg=true` before `dg=false`).
+        // 1. Spend from eligible non-snow restricted buckets first (`dg=true` before `dg=false`, `sr=true` before `sr=false`).
         for dg_first in [true, false] {
-            for (bi, b) in work.buckets.iter_mut().enumerate() {
-                if !b.is_snow && b.disallow_generic == dg_first && b.colors[c_idx] > 0 {
-                    b.colors[c_idx] -= 1;
-                    bucket_spent[bi].1[c_idx] += 1;
-                    return true;
+            for sr_first in [true, false] {
+                for (bi, b) in work.buckets.iter_mut().enumerate() {
+                    if !b.is_snow
+                        && b.disallow_generic == dg_first
+                        && b.has_spend_restriction == sr_first
+                        && b.colors[c_idx] > 0
+                    {
+                        b.colors[c_idx] -= 1;
+                        bucket_spent[bi].1[c_idx] += 1;
+                        return true;
+                    }
                 }
             }
         }
@@ -3432,28 +3499,37 @@ fn consume_one_from_color_idx(
                 return true;
             }
         }
-        // 3. Spend from eligible snow restricted buckets (`dg=true` before `dg=false`).
+        // 3. Spend from eligible snow restricted buckets (`dg=true` before `dg=false`, `sr=true` before `sr=false`).
         for dg_first in [true, false] {
-            for (bi, b) in work.buckets.iter_mut().enumerate() {
-                if b.is_snow && b.disallow_generic == dg_first && b.colors[c_idx] > 0 {
-                    b.colors[c_idx] -= 1;
-                    bucket_spent[bi].1[c_idx] += 1;
-                    return true;
-                }
-            }
-        }
-    } else {
-        // No snow pips: prefer `disallow_generic == true` (non-snow then snow), then `disallow_generic == false` (non-snow then snow).
-        for dg_first in [true, false] {
-            for snow_first in [false, true] {
+            for sr_first in [true, false] {
                 for (bi, b) in work.buckets.iter_mut().enumerate() {
-                    if b.disallow_generic == dg_first
-                        && b.is_snow == snow_first
+                    if b.is_snow
+                        && b.disallow_generic == dg_first
+                        && b.has_spend_restriction == sr_first
                         && b.colors[c_idx] > 0
                     {
                         b.colors[c_idx] -= 1;
                         bucket_spent[bi].1[c_idx] += 1;
                         return true;
+                    }
+                }
+            }
+        }
+    } else {
+        // No snow pips: prefer `disallow_generic == true` (`sr=true` then `sr=false`, non-snow then snow), then `disallow_generic == false`.
+        for dg_first in [true, false] {
+            for sr_first in [true, false] {
+                for snow_first in [false, true] {
+                    for (bi, b) in work.buckets.iter_mut().enumerate() {
+                        if b.disallow_generic == dg_first
+                            && b.has_spend_restriction == sr_first
+                            && b.is_snow == snow_first
+                            && b.colors[c_idx] > 0
+                        {
+                            b.colors[c_idx] -= 1;
+                            bucket_spent[bi].1[c_idx] += 1;
+                            return true;
+                        }
                     }
                 }
             }
@@ -3551,23 +3627,35 @@ fn consume_snow_pip(
         ManaColor::W,
     ];
     // Pass 1: `disallow_generic == true` restricted snow buckets (cannot pay generic anyway).
-    for c in snow_color_order {
-        let idx = color_to_index(c);
-        for (bi, b) in work.buckets.iter_mut().enumerate() {
-            if b.is_snow && b.disallow_generic && b.colors[idx] > 0 {
-                b.colors[idx] -= 1;
-                bucket_spent[bi].1[idx] += 1;
-                return true;
+    for sr_first in [true, false] {
+        for c in snow_color_order {
+            let idx = color_to_index(c);
+            for (bi, b) in work.buckets.iter_mut().enumerate() {
+                if b.is_snow
+                    && b.disallow_generic
+                    && b.has_spend_restriction == sr_first
+                    && b.colors[idx] > 0
+                {
+                    b.colors[idx] -= 1;
+                    bucket_spent[bi].1[idx] += 1;
+                    return true;
+                }
             }
         }
     }
     // Pass 2: `ManaColor::C` snow (`disallow_generic == false` restricted snow buckets, then unrestricted snow `{C}`).
     let c_idx = color_to_index(ManaColor::C);
-    for (bi, b) in work.buckets.iter_mut().enumerate() {
-        if b.is_snow && !b.disallow_generic && b.colors[c_idx] > 0 {
-            b.colors[c_idx] -= 1;
-            bucket_spent[bi].1[c_idx] += 1;
-            return true;
+    for sr_first in [true, false] {
+        for (bi, b) in work.buckets.iter_mut().enumerate() {
+            if b.is_snow
+                && !b.disallow_generic
+                && b.has_spend_restriction == sr_first
+                && b.colors[c_idx] > 0
+            {
+                b.colors[c_idx] -= 1;
+                bucket_spent[bi].1[c_idx] += 1;
+                return true;
+            }
         }
     }
     if work.snow[c_idx] > 0 && work.unrestricted[c_idx] > 0 {
@@ -3585,13 +3673,19 @@ fn consume_snow_pip(
         ManaColor::U,
         ManaColor::W,
     ];
-    for c in colored_snow_order {
-        let idx = color_to_index(c);
-        for (bi, b) in work.buckets.iter_mut().enumerate() {
-            if b.is_snow && !b.disallow_generic && b.colors[idx] > 0 {
-                b.colors[idx] -= 1;
-                bucket_spent[bi].1[idx] += 1;
-                return true;
+    for sr_first in [true, false] {
+        for c in colored_snow_order {
+            let idx = color_to_index(c);
+            for (bi, b) in work.buckets.iter_mut().enumerate() {
+                if b.is_snow
+                    && !b.disallow_generic
+                    && b.has_spend_restriction == sr_first
+                    && b.colors[idx] > 0
+                {
+                    b.colors[idx] -= 1;
+                    bucket_spent[bi].1[idx] += 1;
+                    return true;
+                }
             }
         }
     }
@@ -3940,6 +4034,25 @@ fn solve_flex_pips_and_generic(
     }
 }
 
+fn consume_one_from_unrestricted_idx(
+    work: &mut SimulatedManaPool,
+    c_idx: usize,
+    pool_spent: &mut [u32; 6],
+    snow_spent: &mut [u32; 6],
+) -> bool {
+    if work.unrestricted[c_idx] == 0 {
+        return false;
+    }
+    let non_snow = work.unrestricted[c_idx].saturating_sub(work.snow[c_idx]);
+    work.unrestricted[c_idx] -= 1;
+    pool_spent[c_idx] += 1;
+    if non_snow == 0 && work.snow[c_idx] > 0 {
+        work.snow[c_idx] -= 1;
+        snow_spent[c_idx] += 1;
+    }
+    true
+}
+
 fn consume_generic_mana(
     work: &mut SimulatedManaPool,
     mut rem: u32,
@@ -3962,7 +4075,7 @@ fn consume_generic_mana(
     };
     let mut per_color_used = [0u32; 6];
 
-    // 1. Spend from generic-eligible restricted buckets first (`!disallow_generic`), colorless first.
+    // Tier 1: Spend from generic-eligible target-restricted buckets first (`!disallow_generic && has_spend_restriction`), colorless first.
     let order = [
         ManaColor::C,
         ManaColor::G,
@@ -3972,7 +4085,7 @@ fn consume_generic_mana(
         ManaColor::W,
     ];
     for (bi, b) in work.buckets.iter_mut().enumerate() {
-        if b.disallow_generic {
+        if b.disallow_generic || !b.has_spend_restriction {
             continue;
         }
         for c in order {
@@ -3995,7 +4108,7 @@ fn consume_generic_mana(
         }
     }
 
-    // 2. Spend from unrestricted pool (colorless first, then largest color stack, non-snow before snow).
+    // Tier 2: Spend colorless `{C}` from unrestricted pool first (Tier 2a), then non-spend-restricted `{C}` buckets (Tier 2b, non-snow before snow).
     if rem > 0 {
         let c_idx = color_to_index(ManaColor::C);
         if !restrict_colors || allowed_mask.contains(ColorMask::C) {
@@ -4003,21 +4116,36 @@ fn consume_generic_mana(
                 if work.x_max_one_per_color && per_color_used[c_idx] >= 1 {
                     break;
                 }
-                consume_one_from_color_idx(
-                    work,
-                    c_idx,
-                    false,
-                    false,
-                    bucket_spent,
-                    pool_spent,
-                    snow_spent,
-                );
+                if !consume_one_from_unrestricted_idx(work, c_idx, pool_spent, snow_spent) {
+                    break;
+                }
                 per_color_used[c_idx] += 1;
                 rem -= 1;
+            }
+            for snow_first in [false, true] {
+                if rem == 0 || (work.x_max_one_per_color && per_color_used[c_idx] >= 1) {
+                    break;
+                }
+                for (bi, b) in work.buckets.iter_mut().enumerate() {
+                    if b.disallow_generic || b.has_spend_restriction || b.is_snow != snow_first {
+                        continue;
+                    }
+                    while rem > 0 && b.colors[c_idx] > 0 {
+                        if work.x_max_one_per_color && per_color_used[c_idx] >= 1 {
+                            break;
+                        }
+                        b.colors[c_idx] -= 1;
+                        bucket_spent[bi].1[c_idx] += 1;
+                        per_color_used[c_idx] += 1;
+                        rem -= 1;
+                    }
+                }
             }
         }
     }
 
+    // Tier 3: Spend colored `{WUBRG}` across combined `unrestricted + !disallow_generic && !has_spend_restriction` buckets,
+    // preferring `unrestricted[best_idx]` first, else non-snow then snow `!disallow_generic && !has_spend_restriction` bucket.
     while rem > 0 {
         let mut best_idx = None;
         let mut best_amt = 0u32;
@@ -4029,23 +4157,39 @@ fn consume_generic_mana(
             if work.x_max_one_per_color && per_color_used[idx] >= 1 {
                 continue;
             }
-            if work.unrestricted[idx] > best_amt {
-                best_amt = work.unrestricted[idx];
+            let bucket_sum: u32 = work
+                .buckets
+                .iter()
+                .filter(|b| !b.disallow_generic && !b.has_spend_restriction)
+                .map(|b| b.colors[idx])
+                .sum();
+            let total_amt = work.unrestricted[idx].saturating_add(bucket_sum);
+            if total_amt > best_amt {
+                best_amt = total_amt;
                 best_idx = Some(idx);
             }
         }
         let Some(idx) = best_idx else {
             break;
         };
-        if !consume_one_from_color_idx(
-            work,
-            idx,
-            false,
-            false,
-            bucket_spent,
-            pool_spent,
-            snow_spent,
-        ) {
+        let mut consumed = consume_one_from_unrestricted_idx(work, idx, pool_spent, snow_spent);
+        if !consumed {
+            'bucket_pick: for snow_first in [false, true] {
+                for (bi, b) in work.buckets.iter_mut().enumerate() {
+                    if !b.disallow_generic
+                        && !b.has_spend_restriction
+                        && b.is_snow == snow_first
+                        && b.colors[idx] > 0
+                    {
+                        b.colors[idx] -= 1;
+                        bucket_spent[bi].1[idx] += 1;
+                        consumed = true;
+                        break 'bucket_pick;
+                    }
+                }
+            }
+        }
+        if !consumed {
             break;
         }
         per_color_used[idx] += 1;
@@ -7476,6 +7620,588 @@ mod tests {
                 evaluate_chosen_color_amount(&state, &deep_amt, ColorMask::G, &ctx),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn synth_delayed_rider_and_commander_bonus_generic_spending_order_and_auto_pay() {
+        let scry_rider = DelayedTriggerPayload {
+            trigger: Box::new(mtg_ir::TriggerDef {
+                event: mtg_ir::EventKind::ZoneChange,
+                filter: mtg_ir::EventFilter::default(),
+                scope: None,
+                from_zones: None,
+                only_once_per_turn: false,
+                do_this_once_per_turn: false,
+                is_state_trigger: false,
+                or: vec![],
+                chapter_numbers: SmallVec::new(),
+                is_chapter_ability: false,
+                spell_delayed: None,
+            }),
+            effect: vec![],
+            targets: vec![],
+            next_turn: false,
+        };
+        let make_custom_mana_perm =
+            |name: &str,
+             types: CardTypeMask,
+             extra_costs: Vec<CostDef>,
+             symbols: Vec<ManaColor>,
+             restriction_spec: Option<ManaSpendingRestriction>,
+             delayed_rider: Option<DelayedTriggerPayload>| {
+                CardDef {
+                    oracle_id: format!("oracle_{name}"),
+                    compiler_version: 46,
+                    text_hash: "test".into(),
+                    name: name.into(),
+                    layout: CardLayout::Normal,
+                    faces: vec![FaceDef {
+                        name: name.into(),
+                        characteristics: Characteristics {
+                            mana_cost: ManaCost::default(),
+                            types,
+                            subtypes: SmallVec::new(),
+                            supertypes: SupertypeMask::empty(),
+                            colors: ColorMask::empty(),
+                            color_indicator: None,
+                            pt: None,
+                            loyalty: None,
+                            defense: None,
+                        },
+                        abilities: vec![AbilityDef::Activated(mtg_ir::ActivatedAbility {
+                            id: "mana_ab".into(),
+                            cost: {
+                                let mut c = vec![CostDef::TapSelf];
+                                c.extend(extra_costs);
+                                c
+                            },
+                            targets: vec![],
+                            effect: vec![EffectStep {
+                                subject: Selector::SelfObj,
+                                op: EffectOp::AddMana {
+                                    production: ManaProduction::Fixed {
+                                        symbols: SmallVec::from_vec(symbols),
+                                    },
+                                    restriction: None,
+                                    restriction_spec: restriction_spec.map(Box::new),
+                                    retain_until_eot: false,
+                                    delayed_rider: delayed_rider.map(Box::new),
+                                },
+                                actor: None,
+                                amount: None,
+                                optional: None,
+                                gate: None,
+                                bind_as: None,
+                                do_this_once_per_turn: false,
+                                reflexive_trigger: None,
+                                span: Default::default(),
+                            }],
+                            modal: None,
+                            timing: Timing::Mana,
+                            is_mana: true,
+                            activation_restrictions: vec![],
+                            activation_condition: None,
+                            activator_who: None,
+                            power_up_reduction: false,
+                            x_cant_be_zero: false,
+                            activation_cost_reduction: None,
+                            activation_zones: Default::default(),
+                            cost_keyword: None,
+                            intrinsic: false,
+                            text: None,
+                            grant_condition: None,
+                            x_spend_colors: ColorMask::empty(),
+                            x_colored_only: false,
+                            x_max_one_per_color: false,
+                            span: Default::default(),
+                        })],
+                        has_read_ahead: false,
+                        prototype_spec: None,
+                        cleaved_spell_spec: None,
+                        gift_promised_spell_spec: None,
+                    }],
+                    fully_supported: true,
+                }
+            };
+
+        let make_beacon = |name: &str, cost_raw: &str| CardDef {
+            oracle_id: format!("oracle_{name}"),
+            compiler_version: 46,
+            text_hash: "test".into(),
+            name: name.into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: name.into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::default(),
+                    types: CardTypeMask::ARTIFACT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::empty(),
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![AbilityDef::Activated(mtg_ir::ActivatedAbility {
+                    id: "beacon_ab".into(),
+                    cost: vec![CostDef::Mana {
+                        cost: ManaCost::parse(cost_raw),
+                        x_spend_colors: ColorMask::empty(),
+                        x_colored_only: false,
+                        x_max_one_per_color: false,
+                    }],
+                    targets: vec![],
+                    effect: vec![EffectStep {
+                        subject: Selector::Player {
+                            filter: mtg_ir::PlayerFilter {
+                                relation: mtg_ir::PlayerRelation::You,
+                            },
+                        },
+                        op: EffectOp::Draw {
+                            up_to: false,
+                            reveal_drawn: false,
+                        },
+                        actor: None,
+                        amount: Some(Box::new(mtg_ir::Amount::Const { n: 1 })),
+                        optional: None,
+                        gate: None,
+                        bind_as: None,
+                        do_this_once_per_turn: false,
+                        reflexive_trigger: None,
+                        span: Default::default(),
+                    }],
+                    modal: None,
+                    timing: Timing::Instant,
+                    is_mana: false,
+                    activation_restrictions: vec![],
+                    activation_condition: None,
+                    activator_who: None,
+                    power_up_reduction: false,
+                    x_cant_be_zero: false,
+                    activation_cost_reduction: None,
+                    activation_zones: Default::default(),
+                    cost_keyword: None,
+                    intrinsic: false,
+                    text: None,
+                    grant_condition: None,
+                    x_spend_colors: ColorMask::empty(),
+                    x_colored_only: false,
+                    x_max_one_per_color: false,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        };
+
+        let commander_bonus_spec = ManaSpendingRestriction {
+            on_spend_commander_bonus_counters: true,
+            ..Default::default()
+        };
+        let creature_dg_true = ManaSpendingRestriction {
+            allow_spells: Some(AllowSpellsRestriction {
+                filter: Some(PlainManaFilter {
+                    types_any: CardTypeMask::CREATURE,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            disallow_generic: true,
+            ..Default::default()
+        };
+
+        // 0: Synth Sol Rock ({T}: {C}{C})
+        let sol_rock = make_custom_mana_perm(
+            "Synth Sol Rock",
+            CardTypeMask::ARTIFACT,
+            vec![],
+            vec![ManaColor::C, ManaColor::C],
+            None,
+            None,
+        );
+        // 1: Synth Ancestry B ({T}: {B} + delayed_rider)
+        let ancestry_b = make_custom_mana_perm(
+            "Synth Ancestry B",
+            CardTypeMask::LAND,
+            vec![],
+            vec![ManaColor::B],
+            None,
+            Some(scry_rider.clone()),
+        );
+        // 2: Synth Palace ({1}, {T}: {G} + commander_bonus)
+        let palace_g = make_custom_mana_perm(
+            "Synth Palace G",
+            CardTypeMask::LAND,
+            vec![CostDef::Mana {
+                cost: ManaCost::parse("{1}"),
+                x_spend_colors: ColorMask::empty(),
+                x_colored_only: false,
+                x_max_one_per_color: false,
+            }],
+            vec![ManaColor::G],
+            Some(commander_bonus_spec.clone()),
+            None,
+        );
+        // 3: Synth U-Land ({T}: {U})
+        let u_land = make_land_card(
+            "Synth U-Land",
+            ManaColor::U,
+            SupertypeMask::empty(),
+            SmallVec::new(),
+            None,
+        );
+        // 4: Synth R-Land ({T}: {R})
+        let r_land = make_land_card(
+            "Synth R-Land",
+            ManaColor::R,
+            SupertypeMask::empty(),
+            SmallVec::new(),
+            None,
+        );
+        // 5: Synth W-Land ({T}: {W})
+        let w_land = make_land_card(
+            "Synth W-Land",
+            ManaColor::W,
+            SupertypeMask::empty(),
+            SmallVec::new(),
+            None,
+        );
+        // 6: Synth B-Land ({T}: {B})
+        let b_land = make_land_card(
+            "Synth B-Land",
+            ManaColor::B,
+            SupertypeMask::empty(),
+            SmallVec::new(),
+            None,
+        );
+        // 7: Synth Ancestry W ({T}: {W} + delayed_rider)
+        let ancestry_w = make_custom_mana_perm(
+            "Synth Ancestry W",
+            CardTypeMask::LAND,
+            vec![],
+            vec![ManaColor::W],
+            None,
+            Some(scry_rider.clone()),
+        );
+        // 8: Synth WUBRG Beacon ({W}{U}{B}{R}{G}: Draw 1)
+        let beacon_wubrg = make_beacon("Synth WUBRG Beacon", "{W}{U}{B}{R}{G}");
+        // 9: Synth WBG Beacon ({W}{B}{G}: Draw 1)
+        let beacon_wbg = make_beacon("Synth WBG Beacon", "{W}{B}{G}");
+        // 10: Synth BBG Beacon ({B}{B}{G}: Draw 1)
+        let beacon_bbg = make_beacon("Synth BBG Beacon", "{B}{B}{G}");
+        // 11: Synth Cavern ({T}: {G} creature-only disallow_generic=true)
+        let cavern_g = make_land_card(
+            "Synth Cavern",
+            ManaColor::G,
+            SupertypeMask::empty(),
+            SmallVec::new(),
+            Some(creature_dg_true),
+        );
+        // 12: Synth Bear ({1}{G} creature)
+        let synth_bear = make_spell_card("Synth Bear", "{1}{G}", CardTypeMask::CREATURE);
+
+        let cards = vec![
+            sol_rock,
+            ancestry_b,
+            palace_g,
+            u_land,
+            r_land,
+            w_land,
+            b_land,
+            ancestry_w,
+            beacon_wubrg,
+            beacon_wbg,
+            beacon_bbg,
+            cavern_g,
+            synth_bear,
+        ];
+
+        // Case (a): Synth Sol Rock ({C}{C}) + Synth Ancestry B ({B}, delayed_rider) +
+        // Synth Palace G ({1},{T}:{G}) + Synth U-Land + Synth R-Land + {W} in pool paying {W}{U}{B}{R}{G}.
+        {
+            let mut state = boot_state(cards.clone(), InternTables::default());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(DecisionState::Priority);
+
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [1, 0, 0, 0, 0, 0];
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(0));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(1));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(2));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(3));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(4));
+            let beacon = put_on_battlefield(&mut state, PlayerId(0), CardDefId(8));
+
+            let cands = enumerate_mana_abilities(&state, PlayerId(0));
+            let anc_cand = cands
+                .iter()
+                .find(|c| {
+                    state
+                        .object(c.object)
+                        .is_some_and(|o| o.card_def == CardDefId(1))
+                })
+                .unwrap();
+            assert!(anc_cand.has_delayed_rider);
+            assert_eq!(anc_cand.priority_tier, 1);
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            let cast_acts = crate::casting::legal_casting_actions(&state, PlayerId(0));
+            assert!(cast_acts.contains(&crate::action::Action::AutoPayMana));
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+            assert_eq!(
+                state.player(PlayerId(0)).unwrap().mana_pool,
+                [0, 0, 0, 0, 0, 1]
+            );
+            assert!(
+                state
+                    .player(PlayerId(0))
+                    .unwrap()
+                    .restricted_mana()
+                    .is_empty()
+            );
+            assert_eq!(state.delayed_triggers().len(), 1);
+            assert_eq!(state.stack_mana_riders().len(), 1);
+        }
+
+        // Case (a2): Direct deduct_mana_for_context for {1} (for_generic_cost) with {C} +
+        // delayed_rider {B} + commander_bonus {G} in pool consumes ONLY {C} and leaves riders untouched.
+        {
+            let mut state = boot_state(cards.clone(), InternTables::default());
+            let anc_obj = put_on_battlefield(&mut state, PlayerId(0), CardDefId(1));
+            let pal_obj = put_on_battlefield(&mut state, PlayerId(0), CardDefId(2));
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [0, 0, 0, 0, 0, 1];
+            add_mana_from_production(
+                &mut state,
+                PlayerId(0),
+                Some(anc_obj),
+                &ManaProduction::Fixed {
+                    symbols: SmallVec::from_slice(&[ManaColor::B]),
+                },
+                None,
+                None,
+                false,
+                Some(&scry_rider),
+                None,
+                1,
+            )
+            .unwrap();
+            add_mana_from_production(
+                &mut state,
+                PlayerId(0),
+                Some(pal_obj),
+                &ManaProduction::Fixed {
+                    symbols: SmallVec::from_slice(&[ManaColor::G]),
+                },
+                None,
+                Some(&commander_bonus_spec),
+                false,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+
+            let ctx = ManaSpendContext::for_generic_cost(PlayerId(0));
+            let ded = deduct_mana_for_context(
+                &mut state,
+                PlayerId(0),
+                &ManaCost::parse("{1}"),
+                &ctx,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(ded.spent_counts, [0, 0, 0, 0, 0, 1]);
+            assert_eq!(state.player(PlayerId(0)).unwrap().mana_pool, [0; 6]);
+            assert_eq!(
+                state.player(PlayerId(0)).unwrap().restricted_mana().len(),
+                2
+            );
+            assert!(state.pending_mana_delayed_riders().is_empty());
+            assert!(state.delayed_triggers().is_empty());
+        }
+
+        // Case (b1): 2x Synth W-Land + Synth Ancestry B + Synth Palace G paying {W}{B}{G} via AutoPayMana.
+        {
+            let mut state = boot_state(cards.clone(), InternTables::default());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(DecisionState::Priority);
+
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(5));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(5));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(1));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(2));
+            let beacon = put_on_battlefield(&mut state, PlayerId(0), CardDefId(9));
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+            assert_eq!(state.delayed_triggers().len(), 1);
+        }
+
+        // Case (b2): Synth B-Land + 2x Synth Ancestry W + Synth Palace G paying {W}{B}{G} via AutoPayMana.
+        {
+            let mut state = boot_state(cards.clone(), InternTables::default());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(DecisionState::Priority);
+
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(6));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(7));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(7));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(2));
+            let beacon = put_on_battlefield(&mut state, PlayerId(0), CardDefId(9));
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+        }
+
+        // Case (b3): Pre-existing Synth Ancestry B in restricted_mana + Synth W-Land + Synth B-Land
+        // + Synth Palace G paying {B}{B}{G} via AutoPayMana.
+        {
+            let mut state = boot_state(cards.clone(), InternTables::default());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(DecisionState::Priority);
+
+            let anc_obj = put_on_battlefield(&mut state, PlayerId(0), CardDefId(1));
+            state
+                .object_mut(anc_obj)
+                .unwrap()
+                .flags
+                .insert(ObjectFlags::TAPPED);
+            add_mana_from_production(
+                &mut state,
+                PlayerId(0),
+                Some(anc_obj),
+                &ManaProduction::Fixed {
+                    symbols: SmallVec::from_slice(&[ManaColor::B]),
+                },
+                None,
+                None,
+                false,
+                Some(&scry_rider),
+                None,
+                1,
+            )
+            .unwrap();
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(5));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(6));
+            put_on_battlefield(&mut state, PlayerId(0), CardDefId(2));
+            let beacon = put_on_battlefield(&mut state, PlayerId(0), CardDefId(10));
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+        }
+
+        // Latent disallow_generic: true regression:
+        // 2x disallow_generic:true {G} + 1x unrestricted {G} paying {1}{G} on creature spell
+        // must spend 1 restricted {G} + 1 unrestricted {G}, leaving 1 restricted {G} in pool.
+        {
+            let mut state = boot_state(cards, InternTables::default());
+            let cav_obj = put_on_battlefield(&mut state, PlayerId(0), CardDefId(11));
+            let bear = put_in_hand(&mut state, PlayerId(0), CardDefId(12));
+            let cav_spec = creature_dg_true_spec();
+            add_mana_from_production(
+                &mut state,
+                PlayerId(0),
+                Some(cav_obj),
+                &ManaProduction::Fixed {
+                    symbols: SmallVec::from_slice(&[ManaColor::G, ManaColor::G]),
+                },
+                None,
+                Some(&cav_spec),
+                false,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [0, 0, 0, 0, 1, 0];
+
+            let bear_ctx = ManaSpendContext {
+                player: PlayerId(0),
+                kind: ManaSpendContextKind::Spell,
+                source_object: Some(bear),
+                from_zone: Zone::Hand,
+                ..Default::default()
+            };
+            let ded = deduct_mana_for_context(
+                &mut state,
+                PlayerId(0),
+                &ManaCost::parse("{1}{G}"),
+                &bear_ctx,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(ded.total_spent, 2);
+            assert_eq!(state.player(PlayerId(0)).unwrap().mana_pool, [0; 6]);
+            assert_eq!(
+                state.player(PlayerId(0)).unwrap().restricted_mana().len(),
+                1
+            );
+            assert_eq!(
+                state.player(PlayerId(0)).unwrap().restricted_mana()[0].colors[4],
+                1
+            );
+        }
+
+        fn creature_dg_true_spec() -> ManaSpendingRestriction {
+            ManaSpendingRestriction {
+                allow_spells: Some(AllowSpellsRestriction {
+                    filter: Some(PlainManaFilter {
+                        types_any: CardTypeMask::CREATURE,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                disallow_generic: true,
+                ..Default::default()
+            }
         }
     }
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use mtg_ir::{
@@ -835,7 +836,7 @@ fn fallback_activated_ability_from_lki<'a>(
     lki: &LkiSnapshot,
     face_index: u8,
     ability_idx: usize,
-) -> Option<&'a mtg_ir::ActivatedAbility> {
+) -> Option<Cow<'a, mtg_ir::ActivatedAbility>> {
     let card_def = if lki.card_def != TOKEN_CARD_DEF_ID {
         Some(lki.card_def)
     } else {
@@ -847,11 +848,23 @@ fn fallback_activated_ability_from_lki<'a>(
         .get(usize::from(face_index))
         .or_else(|| card.faces.first())?;
     match face.abilities.get(ability_idx) {
-        Some(AbilityDef::Activated(a)) => Some(a),
-        _ => face.abilities.iter().find_map(|ab| match ab {
-            AbilityDef::Activated(a) => Some(a),
-            _ => None,
-        }),
+        Some(AbilityDef::Activated(a)) => Some(Cow::Borrowed(a)),
+        Some(AbilityDef::Keyword(k)) => {
+            crate::keywords::synthesize_keyword_activated_ability(state.db(), k, ability_idx)
+                .map(Cow::Owned)
+        }
+        _ => face
+            .abilities
+            .iter()
+            .enumerate()
+            .find_map(|(i, ab)| match ab {
+                AbilityDef::Activated(a) => Some(Cow::Borrowed(a)),
+                AbilityDef::Keyword(k) => {
+                    crate::keywords::synthesize_keyword_activated_ability(state.db(), k, i)
+                        .map(Cow::Owned)
+                }
+                _ => None,
+            }),
     }
 }
 

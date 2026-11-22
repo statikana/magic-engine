@@ -554,17 +554,43 @@ fn apply_candidate_to_pool(
     pool: &mut SimulatedManaPool,
     cand: &ManaAbilityCandidate,
     choice: CandidateChoice,
+    generic_any_color: bool,
 ) -> bool {
-    // Check & pay extra_mana_cost (e.g. filter lands / signets) from unrestricted simulated pool first!
-    // Outer spell-restricted buckets (e.g. creature-only mana) cannot pay mana ability activation costs.
+    // Check & pay extra_mana_cost (e.g. filter lands / signets) using `WardOrCost` semantics:
+    // include only `!b.has_spend_restriction` buckets, `generic_any_color`, and cleared X flags.
     if let Some(in_cost) = &cand.extra_mana_cost {
-        let unrestricted_pool = SimulatedManaPool {
-            buckets: Vec::new(),
-            ..pool.clone()
+        let inner_buckets: Vec<SimBucket> = pool
+            .buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.has_spend_restriction && b.colors.iter().any(|&v| v > 0))
+            .map(|(pool_bi, b)| SimBucket {
+                orig_idx: pool_bi,
+                ..*b
+            })
+            .collect();
+        let inner_pool = SimulatedManaPool {
+            unrestricted: pool.unrestricted,
+            snow: pool.snow,
+            buckets: inner_buckets,
+            any_color: generic_any_color,
+            life_available: pool.life_available,
+            cant_pay_life: true,
+            x_spend_colors: ColorMask::empty(),
+            x_colored_only: false,
+            x_max_one_per_color: false,
         };
-        let Some(ded) = solve_pool_deduction(&unrestricted_pool, in_cost, &[], false) else {
+        let Some(ded) = solve_pool_deduction(&inner_pool, in_cost, &[], false) else {
             return false;
         };
+        for &(pool_bi, ref counts) in &ded.bucket_spent {
+            if let Some(b) = pool.buckets.get_mut(pool_bi) {
+                for (i, &amt) in counts.iter().enumerate() {
+                    b.colors[i] = b.colors[i].saturating_sub(amt);
+                }
+            }
+        }
+        pool.buckets.retain(|b| b.colors.iter().any(|&v| v > 0));
         for (i, &amt) in ded.pool_spent.iter().enumerate() {
             pool.unrestricted[i] = pool.unrestricted[i].saturating_sub(amt);
             pool.snow[i] = pool.snow[i]
@@ -612,13 +638,16 @@ fn apply_candidate_to_pool(
         produced[idx] = produced[idx].saturating_add(cand.max_any_color_amount);
     }
 
-    if let Some(spec) = &cand.restriction {
+    if cand.restriction.is_some() || cand.has_delayed_rider {
+        let spec = cand.restriction.as_ref();
         let next_idx = pool.buckets.len() + 10_000;
         pool.buckets.push(SimBucket {
             orig_idx: next_idx,
             colors: produced,
-            disallow_generic: spec.disallow_generic,
+            disallow_generic: spec.is_some_and(|s| s.disallow_generic),
             is_snow: cand.is_snow_source,
+            has_spend_restriction: spec
+                .is_some_and(|s| s.allow_spells.is_some() || s.allow_abilities.is_some()),
         });
     } else {
         for (i, &amt) in produced.iter().enumerate() {
@@ -833,6 +862,9 @@ pub(crate) fn plan_auto_tap_with_constraints_cached(
         };
     }
 
+    let generic_cost_ctx = ManaSpendContext::for_generic_cost(player);
+    let generic_any_color =
+        mana::can_spend_mana_as_any_color_cached(state, player, &generic_cost_ctx, cache);
     let cant_pay_life = base_pool.cant_pay_life;
     let mut candidates: Vec<ManaAbilityCandidate> =
         mana::enumerate_mana_abilities_cached(state, player, cache)
@@ -1020,6 +1052,7 @@ pub(crate) fn plan_auto_tap_with_constraints_cached(
                 needed_mask,
                 &start_state,
                 allow_phy_life,
+                generic_any_color,
                 constraints,
             )
         } else {
@@ -1029,6 +1062,7 @@ pub(crate) fn plan_auto_tap_with_constraints_cached(
                 needed_mask,
                 &start_state,
                 allow_phy_life,
+                generic_any_color,
                 policy.max_beam_width.max(1),
                 constraints,
             )
@@ -1055,6 +1089,7 @@ fn search_exact_backtrack(
     needed_mask: ColorMask,
     start: &SearchState,
     allow_phy_life: bool,
+    generic_any_color: bool,
     constraints: &AutoTapConstraints,
 ) -> Option<SearchState> {
     let mut best: Option<(SearchState, u32)> = None;
@@ -1068,6 +1103,7 @@ fn search_exact_backtrack(
         needed_mask: ColorMask,
         cur: &SearchState,
         allow_phy_life: bool,
+        generic_any_color: bool,
         constraints: &AutoTapConstraints,
         max_depth: usize,
         node_budget: &mut usize,
@@ -1153,7 +1189,7 @@ fn search_exact_backtrack(
             let color_opts = color_options_for_candidate(cand, needed_mask);
             for choice in color_opts {
                 let mut next = cur.clone();
-                if !apply_candidate_to_pool(&mut next.pool, cand, choice) {
+                if !apply_candidate_to_pool(&mut next.pool, cand, choice, generic_any_color) {
                     continue;
                 }
                 next.energy_remaining = next.energy_remaining.saturating_sub(cand.has_energy_cost);
@@ -1183,6 +1219,7 @@ fn search_exact_backtrack(
                     needed_mask,
                     &next,
                     allow_phy_life,
+                    generic_any_color,
                     constraints,
                     max_depth,
                     node_budget,
@@ -1198,6 +1235,7 @@ fn search_exact_backtrack(
         needed_mask,
         start,
         allow_phy_life,
+        generic_any_color,
         constraints,
         max_depth,
         &mut node_budget,
@@ -1206,12 +1244,14 @@ fn search_exact_backtrack(
     best.map(|(s, _)| s)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_beam(
     cost: &ManaCost,
     candidates: &[ManaAbilityCandidate],
     needed_mask: ColorMask,
     start: &SearchState,
     allow_phy_life: bool,
+    generic_any_color: bool,
     beam_width: usize,
     constraints: &AutoTapConstraints,
 ) -> Option<SearchState> {
@@ -1279,7 +1319,7 @@ fn search_beam(
 
                 for choice in color_options_for_candidate(cand, needed_mask) {
                     let mut next = cur.clone();
-                    if !apply_candidate_to_pool(&mut next.pool, cand, choice) {
+                    if !apply_candidate_to_pool(&mut next.pool, cand, choice, generic_any_color) {
                         continue;
                     }
                     next.energy_remaining =
@@ -3208,5 +3248,737 @@ mod tests {
             cache,
         );
         assert!(!plan_cant_life.can_pay);
+    }
+
+    fn make_delayed_rider_payload() -> mtg_ir::DelayedTriggerPayload {
+        mtg_ir::DelayedTriggerPayload {
+            trigger: Box::new(mtg_ir::TriggerDef {
+                event: mtg_ir::EventKind::ZoneChange,
+                filter: mtg_ir::EventFilter::default(),
+                scope: None,
+                from_zones: None,
+                only_once_per_turn: false,
+                do_this_once_per_turn: false,
+                is_state_trigger: false,
+                or: vec![],
+                chapter_numbers: SmallVec::new(),
+                is_chapter_ability: false,
+                spell_delayed: None,
+            }),
+            effect: vec![],
+            targets: vec![],
+            next_turn: false,
+        }
+    }
+
+    fn make_synth_mana_card(
+        name: &str,
+        types: CardTypeMask,
+        mana_cost_raw: &str,
+        extra_costs: Vec<CostDef>,
+        prod: ManaProduction,
+        restriction_spec: Option<mtg_ir::ManaSpendingRestriction>,
+        delayed_rider: Option<mtg_ir::DelayedTriggerPayload>,
+    ) -> CardDef {
+        let mut card = make_tap_mana_card(name, extra_costs, prod, vec![]);
+        card.faces[0].characteristics.types = types;
+        card.faces[0].characteristics.mana_cost = ManaCost::parse(mana_cost_raw);
+        if let AbilityDef::Activated(act) = &mut card.faces[0].abilities[0]
+            && let EffectOp::AddMana {
+                restriction_spec: rs,
+                delayed_rider: dr,
+                ..
+            } = &mut act.effect[0].op
+        {
+            *rs = restriction_spec.map(Box::new);
+            *dr = delayed_rider.map(Box::new);
+        }
+        card
+    }
+
+    fn make_synth_beacon_card(name: &str, cost_raw: &str, x_colored_only: bool) -> CardDef {
+        CardDef {
+            oracle_id: format!("oracle_{name}"),
+            compiler_version: 46,
+            text_hash: "test".into(),
+            name: name.into(),
+            layout: CardLayout::Normal,
+            faces: vec![FaceDef {
+                name: name.into(),
+                characteristics: Characteristics {
+                    mana_cost: ManaCost::parse(cost_raw),
+                    types: CardTypeMask::ARTIFACT,
+                    subtypes: SmallVec::new(),
+                    supertypes: SupertypeMask::empty(),
+                    colors: ColorMask::ALL_COLORS,
+                    color_indicator: None,
+                    pt: None,
+                    loyalty: None,
+                    defense: None,
+                },
+                abilities: vec![AbilityDef::Activated(ActivatedAbility {
+                    id: "beacon_act".into(),
+                    cost: vec![CostDef::Mana {
+                        cost: ManaCost::parse(cost_raw),
+                        x_spend_colors: ColorMask::empty(),
+                        x_colored_only,
+                        x_max_one_per_color: false,
+                    }],
+                    targets: vec![],
+                    effect: vec![EffectStep {
+                        subject: Selector::Player {
+                            filter: mtg_ir::PlayerFilter {
+                                relation: mtg_ir::PlayerRelation::You,
+                            },
+                        },
+                        op: EffectOp::Draw {
+                            up_to: false,
+                            reveal_drawn: false,
+                        },
+                        actor: None,
+                        amount: Some(Box::new(mtg_ir::Amount::Const { n: 1 })),
+                        optional: None,
+                        gate: None,
+                        bind_as: None,
+                        do_this_once_per_turn: false,
+                        reflexive_trigger: None,
+                        span: Default::default(),
+                    }],
+                    modal: None,
+                    timing: Timing::Instant,
+                    is_mana: false,
+                    activation_restrictions: vec![],
+                    activation_condition: None,
+                    activator_who: None,
+                    power_up_reduction: false,
+                    x_cant_be_zero: false,
+                    activation_cost_reduction: None,
+                    activation_zones: Default::default(),
+                    cost_keyword: None,
+                    intrinsic: false,
+                    text: None,
+                    grant_condition: None,
+                    x_spend_colors: ColorMask::empty(),
+                    x_colored_only,
+                    x_max_one_per_color: false,
+                    span: Default::default(),
+                })],
+                has_read_ahead: false,
+                prototype_spec: None,
+                cleaved_spell_spec: None,
+                gift_promised_spell_spec: None,
+            }],
+            fully_supported: true,
+        }
+    }
+
+    #[test]
+    fn synth_delayed_rider_filter_land_sol_ring_autopay_parity() {
+        let cmd_bonus = mtg_ir::ManaSpendingRestriction {
+            on_spend_commander_bonus_counters: true,
+            ..Default::default()
+        };
+        let rider = make_delayed_rider_payload();
+
+        // 0: 5-color commander beacon ({W}{U}{B}{R}{G}: Draw 1)
+        let cmd_beacon = make_synth_beacon_card("Synth WUBRG Commander", "{W}{U}{B}{R}{G}", false);
+        // 1: Synth Sol Rock ({T}: {C}{C})
+        let sol_rock = make_synth_mana_card(
+            "Synth Sol Rock",
+            CardTypeMask::ARTIFACT,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::C, ManaColor::C]),
+            },
+            None,
+            None,
+        );
+        // 2: Synth U-Land ({T}: {U})
+        let u_land = make_synth_mana_card(
+            "Synth U-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::U]),
+            },
+            None,
+            None,
+        );
+        // 3: Synth R-Land ({T}: {R})
+        let r_land = make_synth_mana_card(
+            "Synth R-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::R]),
+            },
+            None,
+            None,
+        );
+        // 4: Synth Ancestry Land ({T}: Choice(CommanderIdentity) + delayed_rider)
+        let ancestry_land = make_synth_mana_card(
+            "Synth Ancestry Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Choice {
+                kind: mtg_ir::ManaChoiceKind::CommanderIdentity,
+                colors: ColorMask::empty(),
+            },
+            None,
+            Some(rider.clone()),
+        );
+        // 5: Synth Palace Land ({1}, {T}: Choice(CommanderIdentity) + commander_bonus)
+        let palace_land = make_synth_mana_card(
+            "Synth Palace Land",
+            CardTypeMask::LAND,
+            "",
+            vec![CostDef::Mana {
+                cost: ManaCost::parse("{1}"),
+                x_spend_colors: ColorMask::empty(),
+                x_colored_only: false,
+                x_max_one_per_color: false,
+            }],
+            ManaProduction::Choice {
+                kind: mtg_ir::ManaChoiceKind::CommanderIdentity,
+                colors: ColorMask::empty(),
+            },
+            Some(cmd_bonus),
+            None,
+        );
+
+        let bundle = IrV2Bundle {
+            ir_version: IR_V2_VERSION,
+            source_compiler_version: 46,
+            tables: InternTables::default(),
+            cards: vec![
+                cmd_beacon,
+                sol_rock,
+                u_land,
+                r_land,
+                ancestry_land,
+                palace_land,
+            ],
+            decks: vec![],
+        };
+        let db = Arc::new(mtg_ir::CardDatabase::from_bundle(bundle).unwrap());
+        let deck = DeckSpec {
+            commanders: vec![CardDefId(0)],
+            mainboard: vec![CardDefId(2); 20],
+            sideboard: vec![],
+        };
+        let cfg = GameConfig {
+            commander: Some(crate::config::CommanderRules::default()),
+            ..GameConfig::standard_1v1()
+        };
+
+        // Subcase A: Fresh untapped sources + {W} in pool paying {W}{U}{B}{R}{G} via AutoPayMana
+        {
+            let mut state = GameState::new(
+                Arc::clone(&db),
+                cfg.clone(),
+                &[deck.clone(), deck.clone()],
+                41,
+            )
+            .unwrap();
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            let beacon = add_bf(&mut state, PlayerId(0), CardDefId(0));
+            add_bf(&mut state, PlayerId(0), CardDefId(1));
+            add_bf(&mut state, PlayerId(0), CardDefId(2));
+            add_bf(&mut state, PlayerId(0), CardDefId(3));
+            add_bf(&mut state, PlayerId(0), CardDefId(4));
+            add_bf(&mut state, PlayerId(0), CardDefId(5));
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [1, 0, 0, 0, 0, 0];
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+            assert_eq!(state.delayed_triggers().len(), 1);
+        }
+
+        // Subcase B: Pre-tapped Synth Ancestry Land ({B} already in restricted_mana) + Synth Sol Rock
+        // + Synth U-Land + Synth R-Land + Synth Palace Land + {W} paying {W}{U}{B}{R}{G} via AutoPayMana
+        {
+            let mut state =
+                GameState::new(Arc::clone(&db), cfg, &[deck.clone(), deck], 42).unwrap();
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            let beacon = add_bf(&mut state, PlayerId(0), CardDefId(0));
+            add_bf(&mut state, PlayerId(0), CardDefId(1));
+            add_bf(&mut state, PlayerId(0), CardDefId(2));
+            add_bf(&mut state, PlayerId(0), CardDefId(3));
+            let anc = add_bf(&mut state, PlayerId(0), CardDefId(4));
+            state
+                .object_mut(anc)
+                .unwrap()
+                .flags
+                .insert(ObjectFlags::TAPPED);
+            mana::add_mana_from_production(
+                &mut state,
+                PlayerId(0),
+                Some(anc),
+                &ManaProduction::Fixed {
+                    symbols: SmallVec::from_slice(&[ManaColor::B]),
+                },
+                None,
+                None,
+                false,
+                Some(&rider),
+                None,
+                1,
+            )
+            .unwrap();
+            add_bf(&mut state, PlayerId(0), CardDefId(5));
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [1, 0, 0, 0, 0, 0];
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+            assert_eq!(state.delayed_triggers().len(), 1);
+        }
+    }
+
+    #[test]
+    fn synth_delayed_rider_and_filter_land_without_sol_ring_cases() {
+        let cmd_bonus = mtg_ir::ManaSpendingRestriction {
+            on_spend_commander_bonus_counters: true,
+            ..Default::default()
+        };
+        let rider = make_delayed_rider_payload();
+
+        // 0: Synth W-Land ({T}: {W})
+        let w_land = make_synth_mana_card(
+            "Synth W-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::W]),
+            },
+            None,
+            None,
+        );
+        // 1: Synth U-Land ({T}: {U})
+        let u_land = make_synth_mana_card(
+            "Synth U-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::U]),
+            },
+            None,
+            None,
+        );
+        // 2: Synth B-Land ({T}: {B})
+        let b_land = make_synth_mana_card(
+            "Synth B-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::B]),
+            },
+            None,
+            None,
+        );
+        // 3: Synth R-Land ({T}: {R})
+        let r_land = make_synth_mana_card(
+            "Synth R-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::R]),
+            },
+            None,
+            None,
+        );
+        // 4: Synth Mono-B Ancestry ({T}: {B} + delayed_rider)
+        let anc_b = make_synth_mana_card(
+            "Synth Mono-B Ancestry",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::B]),
+            },
+            None,
+            Some(rider.clone()),
+        );
+        // 5: Synth Mono-W Ancestry ({T}: {W} + delayed_rider)
+        let anc_w = make_synth_mana_card(
+            "Synth Mono-W Ancestry",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::W]),
+            },
+            None,
+            Some(rider.clone()),
+        );
+        // 6: Synth Palace G ({1}, {T}: {G} + commander_bonus)
+        let palace_g = make_synth_mana_card(
+            "Synth Palace G",
+            CardTypeMask::LAND,
+            "",
+            vec![CostDef::Mana {
+                cost: ManaCost::parse("{1}"),
+                x_spend_colors: ColorMask::empty(),
+                x_colored_only: false,
+                x_max_one_per_color: false,
+            }],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::G]),
+            },
+            Some(cmd_bonus),
+            None,
+        );
+        // 7..=10: Beacons for {W}{U}{B}{R}{G}, {U}{B}{R}{G}, {B}{G}, {W}{G}
+        let beacon_wubrg = make_synth_beacon_card("Synth Beacon WUBRG", "{W}{U}{B}{R}{G}", false);
+        let beacon_ubrg = make_synth_beacon_card("Synth Beacon UBRG", "{U}{B}{R}{G}", false);
+        let beacon_bg = make_synth_beacon_card("Synth Beacon BG", "{B}{G}", false);
+        let beacon_wg = make_synth_beacon_card("Synth Beacon WG", "{W}{G}", false);
+
+        let cards = vec![
+            w_land,
+            u_land,
+            b_land,
+            r_land,
+            anc_b,
+            anc_w,
+            palace_g,
+            beacon_wubrg,
+            beacon_ubrg,
+            beacon_bg,
+            beacon_wg,
+        ];
+
+        // 1. Unpayable 5-pip without colorless rock: {W} + U + R + Mono-B Ancestry + Palace G paying {W}{U}{B}{R}{G}
+        {
+            let mut state = boot(cards.clone());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [1, 0, 0, 0, 0, 0];
+            add_bf(&mut state, PlayerId(0), CardDefId(1));
+            add_bf(&mut state, PlayerId(0), CardDefId(3));
+            add_bf(&mut state, PlayerId(0), CardDefId(4));
+            add_bf(&mut state, PlayerId(0), CardDefId(6));
+            let beacon = add_bf(&mut state, PlayerId(0), CardDefId(7));
+
+            let plan = plan_auto_tap(
+                &state,
+                PlayerId(0),
+                &ManaCost::parse("{W}{U}{B}{R}{G}"),
+                &ManaSpendContext::for_generic_cost(PlayerId(0)),
+                AutoTapPolicy::default(),
+            );
+            assert!(!plan.can_pay);
+            assert!(legality::can_activate_ability(&state, PlayerId(0), beacon, 0).is_none());
+            assert!(
+                crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).is_err()
+            );
+        }
+
+        // 2. Payable 4-pip using rider bucket for filter {1}:
+        // {B} in pool + U + R + Mono-W Ancestry ({W}, delayed_rider) + Palace G ({1},{T}:{G}) paying {U}{B}{R}{G}
+        {
+            let mut state = boot(cards.clone());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            state.player_mut(PlayerId(0)).unwrap().mana_pool = [0, 0, 1, 0, 0, 0];
+            add_bf(&mut state, PlayerId(0), CardDefId(1));
+            add_bf(&mut state, PlayerId(0), CardDefId(3));
+            add_bf(&mut state, PlayerId(0), CardDefId(5));
+            add_bf(&mut state, PlayerId(0), CardDefId(6));
+            let beacon = add_bf(&mut state, PlayerId(0), CardDefId(8));
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+            assert_eq!(state.delayed_triggers().len(), 1);
+        }
+
+        // 3. [Synth W-Land ({W}), Synth Mono-B Ancestry ({B}, delayed_rider), Synth Palace G ({1},{T}:{G})]:
+        // {B}{G} advertises AutoPayMana and succeeds; {W}{G} stays unpayable (parity with Tier 3 {W} selection).
+        {
+            let mut state = boot(cards.clone());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            add_bf(&mut state, PlayerId(0), CardDefId(0));
+            add_bf(&mut state, PlayerId(0), CardDefId(4));
+            add_bf(&mut state, PlayerId(0), CardDefId(6));
+            let beacon_bg_id = add_bf(&mut state, PlayerId(0), CardDefId(9));
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon_bg_id, 0)
+                .unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+        }
+
+        // 4. Pre-tapped Synth Mono-W Ancestry ({W} in restricted_mana) + Synth B-Land ({B}) + Synth Palace G ({1},{T}:{G}):
+        // {W}{G} must NOT falsely advertise AutoPayMana (because {1} consumes {W} from the rider bucket!).
+        // {B}{G} DOES advertise AutoPayMana and succeeds.
+        {
+            let mut state = boot(cards);
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            let anc = add_bf(&mut state, PlayerId(0), CardDefId(5));
+            state
+                .object_mut(anc)
+                .unwrap()
+                .flags
+                .insert(ObjectFlags::TAPPED);
+            mana::add_mana_from_production(
+                &mut state,
+                PlayerId(0),
+                Some(anc),
+                &ManaProduction::Fixed {
+                    symbols: SmallVec::from_slice(&[ManaColor::W]),
+                },
+                None,
+                None,
+                false,
+                Some(&rider),
+                None,
+                1,
+            )
+            .unwrap();
+            add_bf(&mut state, PlayerId(0), CardDefId(2));
+            add_bf(&mut state, PlayerId(0), CardDefId(6));
+            let beacon_wg_id = add_bf(&mut state, PlayerId(0), CardDefId(10));
+            let beacon_bg_id = add_bf(&mut state, PlayerId(0), CardDefId(9));
+
+            let wg_plan = plan_auto_tap(
+                &state,
+                PlayerId(0),
+                &ManaCost::parse("{W}{G}"),
+                &ManaSpendContext::for_generic_cost(PlayerId(0)),
+                AutoTapPolicy::default(),
+            );
+            assert!(!wg_plan.can_pay);
+            assert!(legality::can_activate_ability(&state, PlayerId(0), beacon_wg_id, 0).is_none());
+            assert!(
+                crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon_wg_id, 0)
+                    .is_err()
+            );
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon_bg_id, 0)
+                .unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+        }
+    }
+
+    #[test]
+    fn synth_filter_land_outer_context_isolation() {
+        let cmd_bonus = mtg_ir::ManaSpendingRestriction {
+            on_spend_commander_bonus_counters: true,
+            ..Default::default()
+        };
+        // 0: Synth G-Land ({T}: {G})
+        let g_land = make_synth_mana_card(
+            "Synth G-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::G]),
+            },
+            None,
+            None,
+        );
+        // 1: Synth Sol Rock ({T}: {C}{C})
+        let sol_rock = make_synth_mana_card(
+            "Synth Sol Rock",
+            CardTypeMask::ARTIFACT,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::C, ManaColor::C]),
+            },
+            None,
+            None,
+        );
+        // 2: Synth Palace W ({1}, {T}: {W} + commander_bonus)
+        let palace_w = make_synth_mana_card(
+            "Synth Palace W",
+            CardTypeMask::LAND,
+            "",
+            vec![CostDef::Mana {
+                cost: ManaCost::parse("{1}"),
+                x_spend_colors: ColorMask::empty(),
+                x_colored_only: false,
+                x_max_one_per_color: false,
+            }],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::W]),
+            },
+            Some(cmd_bonus),
+            None,
+        );
+        // 3: Synth X-Colored Beacon ({X}{W}, x_colored_only: true)
+        let x_beacon = make_synth_beacon_card("Synth X-Colored Beacon", "{X}{W}", true);
+        // 4: Synth W-Land ({T}: {W})
+        let w_land = make_synth_mana_card(
+            "Synth W-Land",
+            CardTypeMask::LAND,
+            "",
+            vec![],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::W]),
+            },
+            None,
+            None,
+        );
+        // 5: Synth Filter UU ({G}, {T}: {U}{U})
+        let filter_uu = make_synth_mana_card(
+            "Synth Filter UU",
+            CardTypeMask::LAND,
+            "",
+            vec![CostDef::Mana {
+                cost: ManaCost::parse("{G}"),
+                x_spend_colors: ColorMask::empty(),
+                x_colored_only: false,
+                x_max_one_per_color: false,
+            }],
+            ManaProduction::Fixed {
+                symbols: SmallVec::from_slice(&[ManaColor::U, ManaColor::U]),
+            },
+            None,
+            None,
+        );
+
+        let cards = vec![g_land, sol_rock, palace_w, x_beacon, w_land, filter_uu];
+
+        // 1. Outer x_colored_only: true must NOT block Synth Sol Rock ({C}{C}) from paying Synth Palace W's {1}.
+        {
+            let mut state = boot(cards.clone());
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            add_bf(&mut state, PlayerId(0), CardDefId(0));
+            add_bf(&mut state, PlayerId(0), CardDefId(1));
+            add_bf(&mut state, PlayerId(0), CardDefId(2));
+            let beacon = add_bf(&mut state, PlayerId(0), CardDefId(3));
+
+            crate::casting::begin_activate_ability(&mut state, PlayerId(0), beacon, 0).unwrap();
+            let pid = state.pending_prompt().unwrap().prompt_id;
+            crate::choices::apply_choice_answer(
+                &mut state,
+                PlayerId(0),
+                pid,
+                crate::action::ChoiceAnswer::PickNumber { value: 1 },
+            )
+            .unwrap();
+            assert!(
+                crate::casting::legal_casting_actions(&state, PlayerId(0))
+                    .contains(&crate::action::Action::AutoPayMana)
+            );
+            crate::casting::apply_casting_action(
+                &mut state,
+                PlayerId(0),
+                &crate::action::Action::AutoPayMana,
+            )
+            .unwrap();
+            assert_eq!(state.stack().len(), 1);
+            assert_eq!(
+                state.player(PlayerId(0)).unwrap().mana_pool,
+                [0, 0, 0, 0, 0, 1]
+            );
+        }
+
+        // 2. Outer alt_cast_spend_any_color: true must NOT allow Synth W-Land ({W}) to pay Synth Filter UU's {G}.
+        {
+            let mut state = boot(cards);
+            state.set_active_player(PlayerId(0));
+            state.set_phase(mtg_ir::GamePhase::Main1);
+            state.set_priority_player(PlayerId(0));
+            state.set_decision(crate::action::DecisionState::Priority);
+
+            add_bf(&mut state, PlayerId(0), CardDefId(4));
+            add_bf(&mut state, PlayerId(0), CardDefId(5));
+
+            let mut alt_ctx = ManaSpendContext::for_generic_cost(PlayerId(0));
+            alt_ctx.alt_cast_spend_any_color = true;
+            let plan = plan_auto_tap(
+                &state,
+                PlayerId(0),
+                &ManaCost::parse("{U}{U}"),
+                &alt_ctx,
+                AutoTapPolicy::default(),
+            );
+            assert!(!plan.can_pay);
+        }
     }
 }
