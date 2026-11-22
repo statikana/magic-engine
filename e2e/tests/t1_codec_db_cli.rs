@@ -267,10 +267,15 @@ fn t1_f02_01_export_ir_v2_precons_bundle() {
 
 #[test]
 fn t1_f02_02_export_ir_v2_bulk_corpus() {
-    let corpus = std::path::Path::new("/home/ryan/data/scryfall/oracle-cards.jsonl.gz");
+    let corpus = std::env::var_os("SCRYFALL_CORPUS_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join("data/scryfall/oracle-cards.jsonl.gz")
+        });
     assert!(
         corpus.exists(),
-        "Scryfall bulk corpus must exist at {}",
+        "Scryfall bulk corpus must exist at {} (or set SCRYFALL_CORPUS_PATH)",
         corpus.display()
     );
     let tmp = TempDir::new("f02_02");

@@ -1,6 +1,6 @@
 # 06 — Low-Level TS → Rust Module Map & IR v1 → v2 Translation Spec
 
-This document maps **every production subsystem** in `/home/ryan/statikana/peckhamr.com/src/lib/magic/` (97 non-test files, ~214k LOC + 38 overrides + 1,920 tests) to its destination in `mtg-engine` or `magic-web`, and gives the exact rules for translating TS `ir.ts` v1 into Rust `mtg-ir` v2 with **zero silent drops**.
+This document maps **every production subsystem** in `peckhamr.com/src/lib/magic/` (97 non-test files, ~214k LOC + 38 overrides + 1,920 tests) to its destination in `mtg-engine` or `magic-web`, and gives the exact rules for translating TS `ir.ts` v1 into Rust `mtg-ir` v2 with **zero silent drops**.
 
 ---
 

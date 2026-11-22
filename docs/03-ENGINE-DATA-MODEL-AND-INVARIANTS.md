@@ -67,7 +67,7 @@ pub struct GameState {
 
 ## 3. Four CR Debts Fixed from Day 1
 
-Compared to TS [`ENGINE_INVARIANTS.md`](file:///home/ryan/statikana/peckhamr.com/src/lib/magic/docs/ENGINE_INVARIANTS.md), `mtg-engine` closes four documented architectural gaps at the foundation:
+Compared to TS `ENGINE_INVARIANTS.md`, `mtg-engine` closes four documented architectural gaps at the foundation:
 
 ### A. Real `CR 613.8` Continuous-Effect Dependency Resolution
 - **TS gap:** Layer 4 used 3 hardcoded sub-passes (attached types → type overwrites → additive types/colors) then timestamps.

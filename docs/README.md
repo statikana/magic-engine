@@ -1,6 +1,6 @@
 # TypeScript → Rust Transition Documentation (`docs/`)
 
-This documentation suite is the canonical blueprint for transitioning the Magic: The Gathering engine in `/home/ryan/statikana/peckhamr.com/src/lib/magic/` into a standalone open-source Rust workspace (`mtg-engine`) and a decoupled web application (`magic-web`), leaving `peckhamr.com` as a clean private portfolio/multi-app repo.
+This documentation suite is the canonical blueprint for transitioning the legacy TypeScript Magic: The Gathering engine (`peckhamr.com/src/lib/magic/`) into a standalone open-source Rust workspace (`mtg-engine`) and a decoupled web application (`magic-web`).
 
 The documents are ordered strictly from **high level (strategy & repo topology)** down to **low level (byte-level codecs, file-by-file module maps, differential testing protocols, and production cutover checklists)**.
 
@@ -17,12 +17,10 @@ The documents are ordered strictly from **high level (strategy & repo topology)*
 | **07** | [`07-DIFFERENTIAL-TESTING-AND-COMPILER.md`](./07-DIFFERENTIAL-TESTING-AND-COMPILER.md) | **Low (Verification & Compiler)** | Exact TS ↔ Rust differential testing protocol (replay schema, per-step state digests, triage rules, 41/41 precon parity gate) and Phase 5 native Rust `mtg-compiler` parser architecture (replacing 5,354 JS regexes). |
 | **08** | [`08-MAGIC-WEB-MIGRATION-AND-CUTOVER.md`](./08-MAGIC-WEB-MIGRATION-AND-CUTOVER.md) | **Low (Web, DB & Ops)** | `magic-web` repo structure, `axum` WebSocket actors, append-only SQLite event log + snapshots, migrating `MagicUsers`/`MagicDecks`/`MagicSessions` intact, decoupling the 26k-LOC Svelte 5 UI (shrinking 5.1 MB JS → ~200 KB), Cloudflare + `cloudflared` ops, beta soak, and pruning Magic from `peckhamr.com`. |
 | **09** | [`09-CHALLENGING-RULES-TEST-CATALOG.md`](./09-CHALLENGING-RULES-TEST-CATALOG.md) | **Low (CR Test Spec)** | Comprehensive 47-item challenging MTG rules catalog + 12 flagship stress tests (*Humility*+*Opalescence*, *Blood Moon*+*Urborg*, `CR 704.8` counter annihilation, `CR 903.9a/b` Commander split, `CR 510.1c` combat damage, phasing, copies, split/adventure, rule-modifying effects) mapped to milestones `M2–M7` with synthetic-card assertions. |
-| **10** | [`10-TEAM-MAGIC-WEB-BRIEF.md`](./10-TEAM-MAGIC-WEB-BRIEF.md) | **Execution Brief (Parallel)** | Concrete execution brief for the `magic-web` team: Milestones `W1–W4`, SQLite schema & lossless migration, Rust `axum` REST+WS actors, `GameEngineSession` isolation bridge, `ClientViewModel` contract, Svelte 5 thin client decoupling, and homelab/Cloudflare ops. |
-| **11** | [`11-TEAM-MTG-COMPILER-BRIEF.md`](./11-TEAM-MTG-COMPILER-BRIEF.md) | **Execution Brief (Parallel)** | Concrete execution brief for the native Rust `mtg-compiler` team: isolated `mtg-compiler-work` workspace, single-pass lexer + recursive-descent parser (no JS regex porting), Milestones `C1–C4`, `ir-diff` harness vs. TS oracle, 41/41 precon & 35k Scryfall gates. |
 
 ## Current Baseline Snapshot (Source TS Repo)
 
-Reference numbers measured from `/home/ryan/statikana/peckhamr.com` (`COMPILER_VERSION = 46`, commit `aa82f16`):
+Reference numbers measured from the legacy TypeScript source (`COMPILER_VERSION = 46`, commit `aa82f16`):
 
 - **Production TS engine/compiler/runtime:** ~213,639 LOC across 97 files (`runtime/`: 65 files / 126k LOC; `compiler/`: 19 files / 60k LOC with 5,354 regex literals; top-level: 13 files / 27k LOC).
 - **UI:** ~26,234 LOC across 37 `.svelte`/`.ts` files (currently bundling 5.1 MB minified / 1.22 MB gzipped JS to browsers due to direct engine/compiler imports).

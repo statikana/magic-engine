@@ -14,7 +14,7 @@ Moving to Rust is **not** a line-by-line port—it is a clean-slate v2 architect
 
 ## 2. Three-Repository Split & Ownership Boundaries
 
-The current monolith (`/home/ryan/statikana/peckhamr.com`) splits into **three repositories** with strict dependency direction (`magic-web` depends on `mtg-engine` like any external consumer; `peckhamr.com` has zero Magic code after cutover):
+The current monolith (`peckhamr.com`) splits into **three repositories** with strict dependency direction (`magic-web` depends on `mtg-engine` like any external consumer; `peckhamr.com` has zero Magic code after cutover):
 
 ```mermaid
 flowchart TB

@@ -82,8 +82,8 @@ When you add a new MTG keyword, layer effect, or CR edge case inside `mtg-engine
 | Subcommand | Purpose | Replaces in `peckhamr.com` |
 |---|---|---|
 | `mtg-cli build-db <ir-v2.json \| oracle-cards.jsonl.gz> -o cards.bin [--raw \| --zstd]` | Validates (`deny_unknown_fields`) and compiles JSON IR (Phase 0–4) or Scryfall bulk data (Phase 5) into binary `cards.bin`. | New (AOT IR pipeline) |
-| `mtg-cli inspect-db cards.bin [--verify-precons]` | Prints load latency, card count, fully-supported %, intern table sizes, and verifies every precon deck resolves cleanly. | [`scripts/magic-coverage.ts`](file:///home/ryan/statikana/peckhamr.com/scripts/magic-coverage.ts) |
-| `mtg-cli coverage oracle-cards.jsonl.gz --out COVERAGE.md` *(Phase 5)* | Runs native `mtg-compiler` over the full Scryfall corpus and generates the coverage + top-unparsed-templates report. | [`scripts/magic-coverage.ts`](file:///home/ryan/statikana/peckhamr.com/scripts/magic-coverage.ts) |
+| `mtg-cli inspect-db cards.bin [--verify-precons]` | Prints load latency, card count, fully-supported %, intern table sizes, and verifies every precon deck resolves cleanly. | `scripts/magic-coverage.ts` |
+| `mtg-cli coverage oracle-cards.jsonl.gz --out COVERAGE.md` *(Phase 5)* | Runs native `mtg-compiler` over the full Scryfall corpus and generates the coverage + top-unparsed-templates report. | `scripts/magic-coverage.ts` |
 | `mtg-cli diff-test <cards.bin> <ts-replay.json>` | Replays TS-recorded matches inside Rust `mtg-engine` (with `Mulberry32`), comparing per-step digests and pinpointing the first divergence. | New (Phase 0–2 oracle) |
 | `mtg-cli tournament <cards.bin> --decks ... --agents heuristic,ismcts --games 100` | Multi-threaded headless match runner with win-rate, Elo, steps/sec, and crash/loop reporting. | New (Phase 3 AI bench) |
 

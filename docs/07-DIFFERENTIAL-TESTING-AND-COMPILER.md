@@ -74,7 +74,7 @@ flowchart LR
 ```
 
 ### 1.2 Why `Mulberry32` Matching Matters
-- Because Rust implements the exact 5-line `Mulberry32` and Fisher-Yates shuffle from [`runtime/random.ts`](file:///home/ryan/statikana/peckhamr.com/src/lib/magic/runtime/random.ts#L58-L74), **step 0 asserts identical shuffled `libraryOrderInitial` card-for-card** across all 4 seats before a single card is drawn!
+- Because Rust implements the exact 5-line `Mulberry32` and Fisher-Yates shuffle from `runtime/random.ts`, **step 0 asserts identical shuffled `libraryOrderInitial` card-for-card** across all 4 seats before a single card is drawn!
 - Any PRNG consumption divergence (e.g., an extra shuffle or different random-discard draw order) surfaces immediately at the exact step it happens.
 
 ### 1.3 Comparing `StepDigest` & Triaging Intentional CR Improvements
@@ -98,7 +98,7 @@ Do **not** blindly transliterate all 144k LOC of TS test files. Use a three-tier
 ## 2. Phase 5 — Replacing the 5,354-Regex TS Compiler with Native Rust `mtg-compiler`
 
 ### 2.1 Why Not Port the TS Regexes?
-[`peckhamr.com/src/lib/magic/compiler/`](file:///home/ryan/statikana/peckhamr.com/src/lib/magic/compiler) (60k LOC) contains **5,354 JS `RegExp` literals** (including 43 lookarounds and 12 backreferences). Rust's `regex` crate intentionally forbids lookarounds/backreferences to guarantee linear-time O(n) execution, and compiling thousands of DFAs inflates binary size and startup memory.
+`peckhamr.com/src/lib/magic/compiler/` (60k LOC) contains **5,354 JS `RegExp` literals** (including 43 lookarounds and 12 backreferences). Rust's `regex` crate intentionally forbids lookarounds/backreferences to guarantee linear-time O(n) execution, and compiling thousands of DFAs inflates binary size and startup memory.
 
 ### 2.2 Clean Rust Parser Architecture (`crates/mtg-compiler/`)
 
@@ -136,7 +136,7 @@ Raw Scryfall JSON Face (name, mana_cost, type_line, oracle_text, P/T, loyalty, d
 ```
 
 ### 2.3 Exact Verification Strategy for Phase 5
-Because you have **both** the TS exporter (`scripts/export-ir-v2.ts`) and all **35,062 Scryfall cards** locally (`/home/ryan/data/scryfall/oracle-cards.jsonl.gz`):
+Because you have **both** the TS exporter (`scripts/export-ir-v2.ts`) and all **35,062 Scryfall cards** locally (`$HOME/data/scryfall/oracle-cards.jsonl.gz`):
 
 1. **Corpus-wide IR diffing:** Run both the TS→IRv2 exporter and Rust `mtg-compiler` across all 35,062 Scryfall cards and compare normalized `CardDef` outputs:
    - Track exact parity metrics: `identical_ir`, `rust_newly_supported`, `ts_only_supported` (regressions to close), `semantic_diff`.

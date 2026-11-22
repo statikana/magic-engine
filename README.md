@@ -15,8 +15,6 @@ Start at **[`docs/README.md`](docs/README.md)** for the complete high-to-low-lev
 7. [`docs/07-DIFFERENTIAL-TESTING-AND-COMPILER.md`](docs/07-DIFFERENTIAL-TESTING-AND-COMPILER.md) — TS↔Rust differential replay protocol (41/41 precon parity) & native Rust `mtg-compiler` parser plan
 8. [`docs/08-MAGIC-WEB-MIGRATION-AND-CUTOVER.md`](docs/08-MAGIC-WEB-MIGRATION-AND-CUTOVER.md) — `magic-web` `axum` WS actors, SQLite event log migration, Svelte 5 UI decoupling, beta soak & `peckhamr.com` cleanup
 9. [`docs/09-CHALLENGING-RULES-TEST-CATALOG.md`](docs/09-CHALLENGING-RULES-TEST-CATALOG.md) — 47-item challenging MTG rules catalog & 12 flagship CR stress tests for M2–M7
-10. [`docs/10-TEAM-MAGIC-WEB-BRIEF.md`](docs/10-TEAM-MAGIC-WEB-BRIEF.md) — Parallel team brief for `magic-web` (Rust `axum` server, SQLite migration, Svelte 5 thin client, homelab ops)
-11. [`docs/11-TEAM-MTG-COMPILER-BRIEF.md`](docs/11-TEAM-MTG-COMPILER-BRIEF.md) — Parallel team brief for native Rust `mtg-compiler` (lexer, recursive-descent parser, 35k-card `ir-diff` harness)
 
 ## Workspace Layout
 
