@@ -28,6 +28,7 @@ zstd = "0.13"
 
 mtg-ir = { path = "crates/mtg-ir" }
 mtg-engine = { path = "crates/mtg-engine" }
+mtg-compiler = { path = "crates/mtg-compiler" }
 
 [profile.release]
 lto = "thin"

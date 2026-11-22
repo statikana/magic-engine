@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Oracle text tokenizer and recursive-descent compiler targeting mtg-ir v2"
 
 [dependencies]
+bitflags.workspace = true
 mtg-ir.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
